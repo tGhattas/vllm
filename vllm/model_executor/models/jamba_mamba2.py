@@ -139,6 +139,14 @@ class JambaMoE(nn.Module):
         return hidden_states.view(orig_shape)
 
 
+class MambaWrapper(nn.Module):
+    """Wrapper to create mamba.mixer path structure for checkpoint compatibility."""
+    
+    def __init__(self, mixer: MambaMixer2):
+        super().__init__()
+        self.mixer = mixer
+
+
 class JambaMamba2DecoderLayer(nn.Module):
     """Jamba decoder layer with Mamba2 (SSD) mixer."""
 
@@ -168,8 +176,9 @@ class JambaMamba2DecoderLayer(nn.Module):
         mamba2_d_state = getattr(config, 'mamba2_d_state',
                                  getattr(config, 'mamba_d_state', 64))
         
-        # Use MambaMixer2 (Mamba2/SSD implementation)
-        self.mamba = MambaMixer2(
+        # Use MambaMixer2 (Mamba2/SSD implementation) wrapped in MambaWrapper
+        # to create mamba.mixer path for checkpoint compatibility
+        mixer = MambaMixer2(
             hidden_size=config.hidden_size,
             ssm_state_size=mamba2_d_state,
             conv_kernel_size=config.mamba_d_conv,
@@ -187,6 +196,7 @@ class JambaMamba2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mamba.mixer",
         )
+        self.mamba = MambaWrapper(mixer)
 
         # MLP/MoE layer
         num_experts = getattr(config, 'layers_num_experts', [1] * config.num_hidden_layers)[layer_idx]
@@ -224,7 +234,7 @@ class JambaMamba2DecoderLayer(nn.Module):
 
         # Mamba2 forward - note output is written in-place
         output = torch.empty_like(hidden_states)
-        self.mamba(hidden_states, output, mamba_cache_params, mamba2_metadata)
+        self.mamba.mixer(hidden_states, output, mamba_cache_params, mamba2_metadata)
         
         # Feed-forward
         hidden_states, residual = self.pre_ff_layernorm(output, residual)
@@ -702,8 +712,9 @@ class JambaMamba2ForCausalLM(
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
