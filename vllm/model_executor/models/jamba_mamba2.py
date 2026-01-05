@@ -28,6 +28,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -42,6 +46,7 @@ from .interfaces import (
     HasInnerState,
     IsHybrid,
     SupportsLoRA,
+    SupportsMambaPrefixCaching,
     SupportsPP,
 )
 from .utils import (
@@ -505,6 +510,7 @@ class JambaMamba2ForCausalLM(
     SupportsLoRA,
     SupportsPP,
     IsHybrid,
+    SupportsMambaPrefixCaching,
 ):
     """Jamba model with Mamba2 layers for causal language modeling.
     
@@ -581,12 +587,54 @@ class JambaMamba2ForCausalLM(
         )
         return hidden_states
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        """Get Mamba2 state dtypes for conv and SSM caches."""
+        return MambaStateDtypeCalculator.mamba2_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+        """Calculate shapes for Mamba2's convolutional and SSM state caches."""
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_config
+        
+        # Get Mamba2-specific parameters
+        mamba2_nheads = getattr(hf_config, 'mamba2_nheads',
+                                getattr(hf_config, 'mamba_n_heads', 80))
+        mamba2_headdim = getattr(hf_config, 'mamba2_headdim',
+                                 getattr(hf_config, 'mamba_d_head', 64))
+        mamba2_ngroups = getattr(hf_config, 'mamba2_ngroups',
+                                 getattr(hf_config, 'mamba_n_groups', 1))
+        mamba2_d_state = getattr(hf_config, 'mamba2_d_state',
+                                 getattr(hf_config, 'mamba_d_state', 64))
+        
+        intermediate_size = hf_config.mamba_expand * hf_config.hidden_size
+
+        return MambaStateShapeCalculator.mamba2_state_shape(
+            intermediate_size=intermediate_size,
+            tp_world_size=parallel_config.tensor_parallel_size,
+            n_groups=mamba2_ngroups,
+            num_heads=mamba2_nheads,
+            head_dim=mamba2_headdim,
+            state_size=mamba2_d_state,
+            conv_kernel=hf_config.mamba_d_conv,
+        )
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
