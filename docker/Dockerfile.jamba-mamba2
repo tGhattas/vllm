@@ -4,42 +4,21 @@
 ARG VLLM_VERSION=v0.12.0
 FROM vllm/vllm-openai:${VLLM_VERSION} AS base
 
-# Find the vllm installation path dynamically
-RUN VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])") && \
-    echo "VLLM_PATH=$VLLM_PATH" >> /etc/environment
-
 # Copy the custom Jamba-Mamba2 model implementation
 COPY vllm/model_executor/models/jamba_mamba2.py /tmp/jamba_mamba2.py
+
+# Install the custom model and update registry
 RUN VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])") && \
-    cp /tmp/jamba_mamba2.py "$VLLM_PATH/model_executor/models/jamba_mamba2.py"
-
-# Update the model registry to include JambaMamba2ForCausalLM
-RUN python3 -c "
-import re
-import vllm
-
-vllm_path = vllm.__path__[0]
-registry_path = f'{vllm_path}/model_executor/models/registry.py'
-
-with open(registry_path, 'r') as f:
-    content = f.read()
-
-# Check if already added
-if 'JambaMamba2ForCausalLM' not in content:
-    # Find the _TEXT_GENERATION_MODELS dict and add our model after JambaForCausalLM
-    pattern = r'(\"JambaForCausalLM\": \(\"jamba\", \"JambaForCausalLM\"\),)'
-    replacement = r'\1\n    \"JambaMamba2ForCausalLM\": (\"jamba_mamba2\", \"JambaMamba2ForCausalLM\"),'
-    content = re.sub(pattern, replacement, content)
-    
-    with open(registry_path, 'w') as f:
-        f.write(content)
-    print(f'Registry updated successfully at {registry_path}')
-else:
-    print('Registry already contains JambaMamba2ForCausalLM')
-"
+    cp /tmp/jamba_mamba2.py "$VLLM_PATH/model_executor/models/jamba_mamba2.py" && \
+    REGISTRY_PATH="$VLLM_PATH/model_executor/models/registry.py" && \
+    if ! grep -q "JambaMamba2ForCausalLM" "$REGISTRY_PATH"; then \
+        sed -i 's/"JambaForCausalLM": ("jamba", "JambaForCausalLM"),/"JambaForCausalLM": ("jamba", "JambaForCausalLM"),\n    "JambaMamba2ForCausalLM": ("jamba_mamba2", "JambaMamba2ForCausalLM"),/' "$REGISTRY_PATH" && \
+        echo "Registry updated successfully"; \
+    else \
+        echo "Registry already contains JambaMamba2ForCausalLM"; \
+    fi
 
 # Verify the installation
 RUN python3 -c "from vllm.model_executor.models.jamba_mamba2 import JambaMamba2ForCausalLM; print('JambaMamba2ForCausalLM imported successfully')"
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
-
