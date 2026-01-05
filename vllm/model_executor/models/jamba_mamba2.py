@@ -14,13 +14,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm import envs
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -29,15 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba2_metadata import (
-    Mamba2Metadata,
-    prepare_mamba2_metadata,
-)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
-)
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -46,12 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import LlamaMLP as JambaMLP
-from vllm.model_executor.models.mamba_cache import (
-    MambaCacheManager,
-    MambaCacheParams,
-)
 from vllm.sequence import IntermediateTensors
-from vllm.utils import LayerBlockType
 
 from .interfaces import (
     HasInnerState,
@@ -222,8 +207,6 @@ class JambaMamba2DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        mamba_cache_params: MambaCacheParams,
-        mamba2_metadata: Mamba2Metadata,
         **kwargs,
     ):
         if residual is None:
@@ -232,9 +215,8 @@ class JambaMamba2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Mamba2 forward - note output is written in-place
-        output = torch.empty_like(hidden_states)
-        self.mamba.mixer(hidden_states, output, mamba_cache_params, mamba2_metadata)
+        # Mamba2 forward - vLLM MambaMixer2 handles caching internally
+        output = self.mamba.mixer(hidden_states)
         
         # Feed-forward
         hidden_states, residual = self.pre_ff_layernorm(output, residual)
@@ -334,8 +316,6 @@ class JambaMamba2AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        mamba_cache_params: MambaCacheParams,
-        mamba2_metadata: Mamba2Metadata,
         **kwargs,
     ):
         if residual is None:
@@ -411,7 +391,6 @@ class JambaMamba2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        mamba_cache_params: MambaCacheParams,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -426,36 +405,11 @@ class JambaMamba2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # Prepare Mamba2 metadata for chunk-based computation
-        attn_metadata = get_forward_context().attn_metadata
-        if not envs.VLLM_USE_V1:
-            chunk_size = getattr(self.config, 'mamba2_chunk_size',
-                                getattr(self.config, 'mamba_chunk_size', 256))
-            mamba2_metadata = prepare_mamba2_metadata(
-                chunk_size=chunk_size,
-                attn_metadata=attn_metadata,
-            )
-        else:
-            # v1 gets mamba2_metadata from forward_context
-            mamba2_metadata = None
-
-        # Track cache indices for mamba layers
-        mamba_cache_index = 0
-        
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer_mamba_cache_params = None
-            if isinstance(layer, JambaMamba2DecoderLayer) and mamba_cache_params:
-                layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
-                    mamba_cache_index
-                )
-                mamba_cache_index += 1
-
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                mamba_cache_params=layer_mamba_cache_params,
-                mamba2_metadata=mamba2_metadata,
             )
 
         if not get_pp_group().is_last_rank:
@@ -605,9 +559,6 @@ class JambaMamba2ForCausalLM(
             prefix=maybe_prefix(prefix, "lm_head"),
         )
 
-        # Mamba cache manager - initialized lazily
-        self.mamba_cache: MambaCacheManager | None = None
-
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
         self.make_empty_intermediate_tensors = (
@@ -625,89 +576,10 @@ class JambaMamba2ForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
-        # Initialize mamba cache if needed (lazy init)
-        mamba_cache_params = None
-        if not envs.VLLM_USE_V1:
-            if self.mamba_cache is None:
-                num_mamba_layers = self.model_config.get_num_layers_by_block_type(
-                    self.vllm_config.parallel_config, LayerBlockType.mamba
-                )
-                mamba_state_shape = self.get_mamba_state_shape_from_config(
-                    self.vllm_config, use_v1=False
-                )
-                mamba_state_dtype = self.get_mamba_state_dtype_from_config(
-                    self.vllm_config
-                )
-                self.mamba_cache = MambaCacheManager(
-                    self.vllm_config,
-                    num_mamba_layers,
-                    *mamba_state_shape,
-                    *mamba_state_dtype,
-                )
-
-            mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
-
         hidden_states = self.model(
-            input_ids, positions, mamba_cache_params, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds
         )
         return hidden_states
-
-    def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
-        return self.mamba_cache.copy_inputs_before_cuda_graphs(input_buffers, **kwargs)
-
-    def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
-        return self.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
-
-    @classmethod
-    def get_mamba_state_dtype_from_config(
-        cls,
-        vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        """Get Mamba2 state dtypes for conv and SSM caches."""
-        return MambaStateDtypeCalculator.mamba2_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
-        )
-
-    @classmethod
-    def get_mamba_state_shape_from_config(
-        cls,
-        vllm_config: "VllmConfig",
-        use_v1: bool = True,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
-        """Calculate shapes for Mamba2's convolutional and SSM state caches.
-
-        Returns:
-            Tuple containing:
-            - conv_state_shape: Shape for convolutional state cache
-            - temporal_state_shape: Shape for state space model cache
-        """
-        parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_config
-        
-        # Get Mamba2-specific parameters
-        mamba2_nheads = getattr(hf_config, 'mamba2_nheads',
-                                getattr(hf_config, 'mamba_n_heads', 80))
-        mamba2_headdim = getattr(hf_config, 'mamba2_headdim',
-                                 getattr(hf_config, 'mamba_d_head', 64))
-        mamba2_ngroups = getattr(hf_config, 'mamba2_ngroups',
-                                 getattr(hf_config, 'mamba_n_groups', 1))
-        mamba2_d_state = getattr(hf_config, 'mamba2_d_state',
-                                 getattr(hf_config, 'mamba_d_state', 64))
-        
-        intermediate_size = hf_config.mamba_expand * hf_config.hidden_size
-
-        return MambaStateShapeCalculator.mamba2_state_shape(
-            intermediate_size=intermediate_size,
-            tp_world_size=parallel_config.tensor_parallel_size,
-            n_groups=mamba2_ngroups,
-            num_heads=mamba2_nheads,
-            head_dim=mamba2_headdim,
-            state_size=mamba2_d_state,
-            conv_kernel=hf_config.mamba_d_conv,
-            use_v1=use_v1,
-        )
 
     def compute_logits(
         self,

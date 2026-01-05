@@ -18,9 +18,8 @@ RUN VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])") && \
         echo "Registry already contains JambaMamba2ForCausalLM"; \
     fi
 
-# Verify core vLLM mamba2 dependencies exist
+# Verify the model can be imported
 RUN python3 -c "from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2; print('MambaMixer2 found')" && \
-    python3 -c "from vllm.model_executor.layers.mamba.mamba2_metadata import Mamba2Metadata; print('Mamba2Metadata found')" && \
     python3 -c "from vllm.model_executor.models.jamba_mamba2 import JambaMamba2ForCausalLM; print('JambaMamba2ForCausalLM imported successfully')"
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
