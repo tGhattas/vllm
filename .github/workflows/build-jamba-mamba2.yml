@@ -51,7 +51,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=raw,value=v0.13.0
+            type=raw,value=nightly
             type=sha,prefix=
 
       - name: Build and push Docker image
@@ -65,4 +65,4 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            VLLM_VERSION=v0.13.0
+            VLLM_VERSION=nightly
