@@ -1,0 +1,36 @@
+# Lightweight Dockerfile that adds Jamba-Mamba2 support to official vLLM image
+# This is much faster than building vLLM from scratch
+
+ARG VLLM_VERSION=v0.8.5
+FROM vllm/vllm-openai:${VLLM_VERSION} AS base
+
+# Copy the custom Jamba-Mamba2 model implementation
+COPY vllm/model_executor/models/jamba_mamba2.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/jamba_mamba2.py
+
+# Update the model registry to include JambaMamba2ForCausalLM
+RUN python3 -c "
+import re
+
+registry_path = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py'
+with open(registry_path, 'r') as f:
+    content = f.read()
+
+# Check if already added
+if 'JambaMamba2ForCausalLM' not in content:
+    # Find the _TEXT_GENERATION_MODELS dict and add our model after JambaForCausalLM
+    pattern = r'(\"JambaForCausalLM\": \(\"jamba\", \"JambaForCausalLM\"\),)'
+    replacement = r'\1\n    \"JambaMamba2ForCausalLM\": (\"jamba_mamba2\", \"JambaMamba2ForCausalLM\"),'
+    content = re.sub(pattern, replacement, content)
+    
+    with open(registry_path, 'w') as f:
+        f.write(content)
+    print('Registry updated successfully')
+else:
+    print('Registry already contains JambaMamba2ForCausalLM')
+"
+
+# Verify the installation
+RUN python3 -c "from vllm.model_executor.models.jamba_mamba2 import JambaMamba2ForCausalLM; print('JambaMamba2ForCausalLM imported successfully')"
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+
