@@ -1,7 +1,7 @@
 # Lightweight Dockerfile that adds Jamba-Mamba2 support to official vLLM image
 # This is much faster than building vLLM from scratch
 
-ARG VLLM_VERSION=v0.12.0
+ARG VLLM_VERSION=v0.13.0
 FROM vllm/vllm-openai:${VLLM_VERSION} AS base
 
 # Copy the custom Jamba-Mamba2 model implementation
