@@ -1,17 +1,26 @@
 # Lightweight Dockerfile that adds Jamba-Mamba2 support to official vLLM image
 # This is much faster than building vLLM from scratch
 
-ARG VLLM_VERSION=v0.8.5
+ARG VLLM_VERSION=v0.12.0
 FROM vllm/vllm-openai:${VLLM_VERSION} AS base
 
+# Find the vllm installation path dynamically
+RUN VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])") && \
+    echo "VLLM_PATH=$VLLM_PATH" >> /etc/environment
+
 # Copy the custom Jamba-Mamba2 model implementation
-COPY vllm/model_executor/models/jamba_mamba2.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/jamba_mamba2.py
+COPY vllm/model_executor/models/jamba_mamba2.py /tmp/jamba_mamba2.py
+RUN VLLM_PATH=$(python3 -c "import vllm; print(vllm.__path__[0])") && \
+    cp /tmp/jamba_mamba2.py "$VLLM_PATH/model_executor/models/jamba_mamba2.py"
 
 # Update the model registry to include JambaMamba2ForCausalLM
 RUN python3 -c "
 import re
+import vllm
 
-registry_path = '/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py'
+vllm_path = vllm.__path__[0]
+registry_path = f'{vllm_path}/model_executor/models/registry.py'
+
 with open(registry_path, 'r') as f:
     content = f.read()
 
@@ -24,7 +33,7 @@ if 'JambaMamba2ForCausalLM' not in content:
     
     with open(registry_path, 'w') as f:
         f.write(content)
-    print('Registry updated successfully')
+    print(f'Registry updated successfully at {registry_path}')
 else:
     print('Registry already contains JambaMamba2ForCausalLM')
 "
