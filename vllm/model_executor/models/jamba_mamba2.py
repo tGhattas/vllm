@@ -425,7 +425,7 @@ class JambaMamba2Model(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return FusedMoE.make_expert_params_mapping(
+        return FusedMoE.make_expert_params_mapping(self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
