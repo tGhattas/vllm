@@ -272,6 +272,7 @@ def run_kernel_prefill(
     prefill_len: int,
     chunk_size: int,
     state_dtype: torch.dtype,
+    fp32_state_dot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prefill P tokens with mamba_chunk_scan_combined_varlen.
 
@@ -308,6 +309,7 @@ def run_kernel_prefill(
         dt_bias=inputs.dt_bias,
         dt_softplus=True,
         state_dtype=state_dtype,
+        fp32_state_dot=fp32_state_dot,
     )
     return out, final_state.squeeze(0)
 
@@ -319,6 +321,7 @@ def run_flow_a_chunk_scan(
     nsteps: int,
     chunk_size: int,
     state_dtype: torch.dtype,
+    fp32_state_dot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Flow A: decode via 1-token mamba_chunk_scan_combined_varlen calls.
 
@@ -359,6 +362,7 @@ def run_flow_a_chunk_scan(
             initial_states=state,
             dt_softplus=True,
             state_dtype=state_dtype,
+            fp32_state_dot=fp32_state_dot,
         )
         ys.append(out.squeeze(0))
         states.append(state.squeeze(0).clone())
@@ -488,11 +492,21 @@ def run_case(
     )
 
     _, prefill_state = run_kernel_prefill(
-        inputs, prefill_len, args.chunk_size, state_dtype
+        inputs,
+        prefill_len,
+        args.chunk_size,
+        state_dtype,
+        fp32_state_dot=args.fp32_state_dot,
     )
 
     ys_a, st_a = run_flow_a_chunk_scan(
-        prefill_state, inputs, prefill_len, nsteps, args.chunk_size, state_dtype
+        prefill_state,
+        inputs,
+        prefill_len,
+        nsteps,
+        args.chunk_size,
+        state_dtype,
+        fp32_state_dot=args.fp32_state_dot,
     )
     ys_b, st_b = run_flow_b_selective_state_update(
         prefill_state, inputs, prefill_len, nsteps, state_dtype
@@ -522,12 +536,122 @@ def run_case(
         "prefill_len": prefill_len,
         "decode_steps": nsteps,
         "seed": seed,
+        "fp32_state_dot": args.fp32_state_dot,
         **metrics,
     }
 
 
 def dtype_name(dtype: torch.dtype) -> str:
     return {v: k for k, v in DTYPE_MAP.items()}.get(dtype, str(dtype))
+
+
+def run_latency_benchmark(
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[dict[str, Any]]:
+    """Latency of chunk_scan with/without fp32_state_dot vs the decode kernel.
+
+    Times a P-token prefill call and a 1-token decode-recompute call of
+    ``mamba_chunk_scan_combined_varlen`` with the flag off/on, plus a
+    ``selective_state_update`` call for reference.
+    """
+    from triton.testing import do_bench
+
+    from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
+    from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+        mamba_chunk_scan_combined_varlen,
+    )
+    from vllm.v1.attention.backends.mamba2_attn import compute_varlen_chunk_metadata
+
+    state_dtype = dtype if args.state_dtype == "same" else DTYPE_MAP[args.state_dtype]
+    prefill_len = max(args.prefill_lens)
+    inputs = quantize_inputs(
+        generate_inputs(
+            prefill_len + 1,
+            args.nheads,
+            args.headdim,
+            args.dstate,
+            args.ngroups,
+            0,
+            device,
+        ),
+        dtype,
+    )
+
+    def chunk_scan_call(start: int, length: int, initial_states, fp32_state_dot):
+        cu_seqlens = torch.tensor([0, length], dtype=torch.int32, device=device)
+        cu_chunk_seqlens, last_chunk_indices, seq_idx = compute_varlen_chunk_metadata(
+            cu_seqlens, args.chunk_size
+        )
+        out = torch.empty_like(inputs.x[start : start + length])
+        return lambda: mamba_chunk_scan_combined_varlen(
+            inputs.x[start : start + length],
+            inputs.dt[start : start + length],
+            inputs.A,
+            inputs.B[start : start + length],
+            inputs.C[start : start + length],
+            args.chunk_size,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx,
+            out=out,
+            D=inputs.D,
+            dt_bias=inputs.dt_bias,
+            initial_states=initial_states,
+            dt_softplus=True,
+            state_dtype=state_dtype,
+            fp32_state_dot=fp32_state_dot,
+        )
+
+    _, prefill_state = run_kernel_prefill(
+        inputs, prefill_len, args.chunk_size, state_dtype
+    )
+    init = prefill_state.unsqueeze(0)
+
+    # selective_state_update call mirroring the mixer's decode expansion
+    nheads, headdim, dstate = prefill_state.shape
+    ssu_state = init.clone().contiguous()
+    A_d = inputs.A[:, None, None].expand(nheads, headdim, dstate)
+    dt_bias_d = inputs.dt_bias[:, None].expand(nheads, headdim)
+    D_d = inputs.D[:, None].expand(nheads, headdim)
+    x_t = inputs.x[prefill_len:]
+    dt_t = inputs.dt[prefill_len:][:, :, None].expand(1, nheads, headdim)
+    ssu_out = torch.empty_like(x_t)
+
+    def ssu_call():
+        selective_state_update(
+            ssu_state,
+            x_t,
+            dt_t,
+            A_d,
+            inputs.B[prefill_len:],
+            inputs.C[prefill_len:],
+            D_d,
+            dt_bias_d,
+            dt_softplus=True,
+            out=ssu_out,
+        )
+
+    cases = [
+        (
+            f"prefill_P{prefill_len} chunk_scan",
+            chunk_scan_call(0, prefill_len, None, False),
+        ),
+        (
+            f"prefill_P{prefill_len} chunk_scan+fp32dot",
+            chunk_scan_call(0, prefill_len, None, True),
+        ),
+        ("decode_1tok chunk_scan", chunk_scan_call(prefill_len, 1, init, False)),
+        ("decode_1tok chunk_scan+fp32dot", chunk_scan_call(prefill_len, 1, init, True)),
+        ("decode_1tok selective_state_update", ssu_call),
+    ]
+    rows = []
+    for label, fn in cases:
+        ms = do_bench(fn, warmup=25, rep=100)
+        rows.append({"dtype": dtype_name(dtype), "op": label, "ms": ms})
+    return rows
 
 
 def collect_env_info(device: torch.device) -> dict[str, Any]:
@@ -576,6 +700,8 @@ def format_markdown(results: list[dict[str, Any]], env: dict[str, Any]) -> str:
         "Flows: A = 1-token `mamba_chunk_scan_combined_varlen` w/ initial_states,",
         "B = `selective_state_update`, C = fp64 PyTorch reference.",
         "Relative errors are w.r.t. the fp64 reference magnitudes.",
+        "chunk_scan fp32_state_dot: "
+        f"{results[0]['fp32_state_dot'] if results else '-'}",
         "",
         "| dtype | state | P | seed | pair | max_abs | rel_mean | rel_p50 |"
         " rel_p99 | state rel_p99 (last) |",
@@ -674,6 +800,19 @@ def parse_args() -> argparse.Namespace:
         "(mamba_ssm_cache_dtype='auto' -> model dtype).",
     )
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    p.add_argument(
+        "--fp32-state-dot",
+        action="store_true",
+        help="Run the chunk-scan flows (prefill and flow A) with "
+        "fp32_state_dot=True: the state-propagation term is computed with an "
+        "IEEE fp32 tl.dot instead of bf16/fp16 inputs (or TF32 on Ampere+).",
+    )
+    p.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Measure kernel latency with/without fp32_state_dot instead of "
+        "running the accuracy sweep.",
+    )
     p.add_argument("--results-dir", default="./results")
     p.add_argument("--quick", action="store_true", help="One small configuration only.")
     p.add_argument(
@@ -708,6 +847,28 @@ def main() -> int:
             print("WARNING: skipping bf16 (no native support on this GPU)")
             continue
         dtypes.append(DTYPE_MAP[name])
+
+    if args.benchmark:
+        env = collect_env_info(device)
+        bench_rows = []
+        for dtype in dtypes:
+            print(f"benchmarking dtype={dtype_name(dtype)}...", file=sys.stderr)
+            bench_rows.extend(run_latency_benchmark(args, dtype, device))
+        print(f"## Kernel latency (median ms), {env.get('gpu_name', '-')}\n")
+        print("| dtype | op | ms |")
+        print("|---|---|---|")
+        for r in bench_rows:
+            print(f"| {r['dtype']} | {r['op']} | {r['ms']:.4f} |")
+        os.makedirs(args.results_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        gpu_tag = env.get("gpu_name", "cpu").replace(" ", "_")
+        out_path = os.path.join(args.results_dir, f"benchmark_{gpu_tag}_{stamp}.json")
+        with open(out_path, "w") as f:
+            json.dump(
+                {"env": env, "args": vars(args), "results": bench_rows}, f, indent=2
+            )
+        print(f"\nJSON written to {out_path}")
+        return 0
 
     results = []
     for dtype in dtypes:
