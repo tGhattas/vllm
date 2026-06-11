@@ -142,7 +142,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
             num_warps=2,
         ),
     ],
-    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL", "FP32_STATE_DOT"],
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
@@ -208,6 +208,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    FP32_STATE_DOT: tl.constexpr,
 ):
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
@@ -279,10 +280,11 @@ def _chunk_scan_fwd_kernel(
             other=0.0,
         )
 
+        prev_states_dtype = tl.float32 if FP32_STATE_DOT else C_ptr.dtype.element_ty
         if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
             # if no init states AND starting a new sequence, we need zeros
             prev_states = tl.zeros(
-                (BLOCK_SIZE_DSTATE, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
+                (BLOCK_SIZE_DSTATE, BLOCK_SIZE_N), dtype=prev_states_dtype
             )
         else:
             # otherwise read the previous state
@@ -296,9 +298,18 @@ def _chunk_scan_fwd_kernel(
                 mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
                 other=0.0,
             )
-            prev_states = prev_states.to(C_ptr.dtype.element_ty)
+            prev_states = prev_states.to(prev_states_dtype)
 
-        acc = tl.dot(C, prev_states) * scale_m[:, None]
+        if FP32_STATE_DOT:
+            # keep the carried state in fp32 and use an IEEE fp32 dot
+            # (instead of bf16/fp16 inputs or TF32 on Ampere+) for the term
+            # that propagates initial/inter-chunk states
+            acc = (
+                tl.dot(C.to(tl.float32), prev_states, input_precision="ieee")
+                * scale_m[:, None]
+            )
+        else:
+            acc = tl.dot(C, prev_states) * scale_m[:, None]
 
     else:
         prev_states_ptrs = (
@@ -306,6 +317,7 @@ def _chunk_scan_fwd_kernel(
             + offs_n[None, :] * prev_states_hdim
             + offs_k_dstate[:, None] * prev_states_dstate
         )
+        prev_states_dtype = tl.float32 if FP32_STATE_DOT else C_ptr.dtype.element_ty
         for k in range(0, dstate, BLOCK_SIZE_K):
             C = tl.load(
                 C_ptrs,
@@ -315,7 +327,7 @@ def _chunk_scan_fwd_kernel(
             )
             if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
                 prev_states = tl.zeros(
-                    (BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
+                    (BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=prev_states_dtype
                 )
             else:
                 prev_states = tl.load(
@@ -324,8 +336,11 @@ def _chunk_scan_fwd_kernel(
                     & (offs_n[None, :] < hdim),
                     other=0.0,
                 )
-                prev_states = prev_states.to(C_ptr.dtype.element_ty)
-            acc += tl.dot(C, prev_states)
+                prev_states = prev_states.to(prev_states_dtype)
+            if FP32_STATE_DOT:
+                acc += tl.dot(C.to(tl.float32), prev_states, input_precision="ieee")
+            else:
+                acc += tl.dot(C, prev_states)
             C_ptrs += BLOCK_SIZE_K
             prev_states_ptrs += BLOCK_SIZE_K
         acc *= scale_m[:, None]
@@ -428,6 +443,7 @@ def _chunk_scan_fwd(
     D=None,
     z=None,
     initial_states=None,
+    fp32_state_dot=False,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
 
@@ -521,5 +537,6 @@ def _chunk_scan_fwd(
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        FP32_STATE_DOT=fp32_state_dot,
     )
     return

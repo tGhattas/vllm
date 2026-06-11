@@ -202,7 +202,10 @@ def generate_continuous_batched_examples(
 @pytest.mark.parametrize("n_heads", [4, 16, 32])
 @pytest.mark.parametrize("d_head", [5, 8, 32, 128])
 @pytest.mark.parametrize("seq_len_chunk_size", [(112, 16), (128, 32)])
-def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, itype):
+@pytest.mark.parametrize("fp32_state_dot", [False, True])
+def test_mamba_chunk_scan_single_example(
+    d_head, n_heads, seq_len_chunk_size, itype, fp32_state_dot
+):
     # this tests the kernels on a single example (bs=1)
 
     # TODO: the bfloat16 case requires higher thresholds. To be investigated
@@ -249,6 +252,7 @@ def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, it
         seq_idx=seq_idx_chunks,
         out=Y,
         D=None,
+        fp32_state_dot=fp32_state_dot,
     )
 
     # just test the last in sequence
@@ -361,7 +365,10 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     "seqlens",
     [(16, 20), (270, 88, 212, 203)],
 )
-def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
+@pytest.mark.parametrize("fp32_state_dot", [False, True])
+def test_mamba_chunk_scan_cont_batch_prefill_chunking(
+    chunk_size, seqlens, fp32_state_dot
+):
     # This test verifies the correctness of the chunked prefill implementation
     # in the mamba2 ssd kernels, by comparing concatenation (in the sequence
     # dimension) of chunked results with the full sequence result.
@@ -424,6 +431,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         out=Y_ref,
         D=None,
         initial_states=None,
+        fp32_state_dot=fp32_state_dot,
     )
 
     ## chunked seqlen computation
@@ -473,6 +481,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         out=Y_partial,
         D=None,
         initial_states=None,
+        fp32_state_dot=fp32_state_dot,
     )
 
     # remaining chunk
@@ -546,6 +555,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         out=Y_chunked,
         D=None,
         initial_states=partial_state,
+        fp32_state_dot=fp32_state_dot,
     )
     Y = concat_batch_f(Y_partial, Y_chunked)
 

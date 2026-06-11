@@ -44,6 +44,7 @@ def _mamba_chunk_scan_combined_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
+    fp32_state_dot=False,
 ):
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     seqlen, nheads, headdim = x.shape
@@ -146,6 +147,7 @@ def _mamba_chunk_scan_combined_fwd(
         D=D,
         z=z,
         initial_states=initial_states,
+        fp32_state_dot=fp32_state_dot,
     )
 
     if return_intermediate_states:
@@ -174,6 +176,7 @@ def mamba_chunk_scan_combined_varlen(
     dt_limit=(0.0, float("inf")),
     return_intermediate_states=False,
     state_dtype=None,
+    fp32_state_dot=False,
 ):
     """
     Argument:
@@ -195,6 +198,9 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus: Whether to apply softplus to dt
         out: (seqlen, nheads, headdim) preallocated output tensor
         state_dtype: The data type of the ssm state
+        fp32_state_dot: Compute the chunk-scan term that propagates
+            initial/inter-chunk states in IEEE fp32 (no bf16/fp16 downcast,
+            no TF32). More accurate for prefix continuation, but slower.
     Return:
         varlen_states: (batch, nheads, headdim, dstate)
     """
@@ -222,6 +228,7 @@ def mamba_chunk_scan_combined_varlen(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
+        fp32_state_dot=fp32_state_dot,
     )
 
     return varlen_states
