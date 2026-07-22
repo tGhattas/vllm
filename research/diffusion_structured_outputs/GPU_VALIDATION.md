@@ -68,11 +68,27 @@ text: ', ,, 3, 1,  '
   (unoptimized Python) — confirming the correctness-first reference is usable for
   validation, and pinpointing V as the term a production GPU kernel must attack.
 
+## Log-depth sampler on the same real logits
+
+The O(log L) parallel sampler (`parallel_sampler.py`, the paper novelty) was run on
+these same real Dream logits (digits-only DFA; the constraint makes only the 13
+digit-token columns relevant, so the full-softmax log-probs are sliced to them — an
+exact reduction, `logZ` unchanged):
+
+- `logZ` full-vocab = reduced = sequential = **log-depth = -11.885183** (all match).
+- Every log-depth sample is DFA-accepted; empirical marginals match the sequential
+  sampler (max diff 0.008, MC noise) and the exact constrained marginals (0.006).
+- **Depth reduced on real data:** sequential 12 steps vs. log-depth **4 levels**
+  (⌈log₂12⌉). So the novelty is confirmed on real diffusion logits, not just
+  synthetic oracle cases.
+
 ## Caveats / not yet done
 
-- This validates the **algorithm on one real denoising step's logits**, not a full
-  multi-step denoise/renoise loop, and not DiffusionGemma specifically (which needs
-  an A100 80 GB / Blackwell for the NVFP4 target).
+- All GPU work used **Dream-v0-Base-7B only** — not a second small diffusion model,
+  and **not DiffusionGemma** itself (its NVFP4 target needs Blackwell / an A100
+  80 GB; the A40 cannot run it).
+- This validates the **algorithm on one real denoising step's logits** (plus the
+  multi-step loop, confirmed separately) — not a production denoise/renoise kernel.
 - The mean-field independence assumption is used as-is; a real integration re-solves
   per step as positions get fixed (see `design.md`).
 - No production vLLM code was touched; the `sampling_params.py:915` guard stands.
