@@ -16,10 +16,14 @@ harness. See the top-level task guardrails.
 | `architecture.md` | Verified code map: AR structured-output path, the real diffusion guard (`sampling_params.py:915`), DiffusionGemma denoise/commit, the exact AR-vs-diffusion mismatch, a sequence diagram, and the insertion seam. |
 | `design.md` | Integration design exploration answering the 10 design questions; a derived (non-final) `DiffusionConstraint` interface. |
 | `finite_automaton.py` | `DFA` over integer tokens (partial transition = reject) + trie/exact-string constructors. |
-| `constrained_sampler.py` | Exact constrained-canvas sampler: log-space forward/backward DP → `marginals`, `sample`, `greedy` (Viterbi/MAP), `log_partition`, `fixed_positions`, impossibility detection. |
+| `constrained_sampler.py` | Exact constrained-canvas sampler: log-space forward/backward DP → `marginals`, `sample`, `greedy` (Viterbi/MAP), `log_partition`, `fixed_positions`, impossibility detection. **O(L) sequential.** |
+| `denoise_loop.py` | Multi-step constrained denoising loop (confidence-based schedule, re-solving as positions are committed). Verified exact via chain rule. |
+| `parallel_sampler.py` | **Log-depth (O(log L)) parallel sampler** — the paper's novelty (Dang & Ermon Alg. 1): log-semiring segment tree of transition-matrix products + top-down midpoint-state recursion. Same distribution as the sequential sampler. |
 | `brute_force_oracle.py` | Exhaustive-enumeration ground truth for tiny cases. |
-| `tests/test_constrained_sampler.py` | 19 seeded, CPU-only oracle tests. |
-| `model_adapters/` | (placeholder) real-diffusion-logits adapter for GPU validation. |
+| `LOGDEPTH_PLAN.md` | Phase-2 plan mapping the paper's Algorithm 1 to `parallel_sampler.py`. |
+| `GPU_VALIDATION.md` | Real Dream-7B logit results (single-step; the multi-step loop confirmed separately). |
+| `tests/` | 46 seeded, CPU-only oracle tests (sampler 21, denoise loop 7, parallel sampler 18). |
+| `model_adapters/` | Real-diffusion-logits bridge into the verified sampler (CPU-tested). |
 
 ## The problem the sampler solves
 
@@ -66,7 +70,7 @@ cd research/diffusion_structured_outputs
 ../../.venv/bin/python -m pytest tests/ -q
 ```
 
-Current result: **19 passed**. Coverage: exact-single-string DFA, multi-string DFA,
+Current result: **46 passed**. Coverage: exact-single-string DFA, multi-string DFA,
 regular pattern (parity), impossible constraint, compatible fixed token, impossible
 fixed token, highly-skewed logits, very-small probabilities, greedy == brute-force
 MAP, sampler-reproduces-exact-distribution (Monte Carlo), and the
