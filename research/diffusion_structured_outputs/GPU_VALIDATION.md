@@ -82,6 +82,28 @@ exact reduction, `logZ` unchanged):
   (⌈log₂12⌉). So the novelty is confirmed on real diffusion logits, not just
   synthetic oracle cases.
 
+## Batched GPU sampler on the A40 (torch)
+
+`gpu_constrained_sampler.py` is a vectorized torch port of the log-depth algorithm
+(batched scatter-logsumexp transition build + level-batched log-semiring product
+tree + level-batched top-down midpoint sampling). Benchmarked on the A40 with a real
+3-field JSON schema (`{"name":string,"age":integer,"active":boolean}`) compiled to a
+token DFA (N=44 states, V=46):
+
+| L | B | ms/batch | canvases/s | tree depth |
+| --- | --- | --- | --- | --- |
+| 48 | 512 | 102 | 5021 | 6 |
+| 64 | 512 | 102 | 5021 | 6 |
+| 128 | 512 | 196 | 2619 | 7 |
+| 256 | 512 | 382 | 1340 | 8 |
+
+- **Numerically exact vs the CPU reference:** `logZ` gpu = numpy = 136.08158.
+- Every sampled canvas is DFA-accepted (valid JSON); tree depth = ⌈log₂L⌉.
+- This is a *vectorized torch implementation*, not a hand-written CUDA/Triton
+  kernel (the frugal log-matmul uses an N-step loop to keep memory at O(N²)); a
+  production kernel would be much faster. The value: the algorithm ports to batched
+  device ops, matches the reference exactly, and scales with O(log L) depth.
+
 ## Caveats / not yet done
 
 - All GPU work used **Dream-v0-Base-7B only** — not a second small diffusion model,

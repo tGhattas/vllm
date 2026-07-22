@@ -19,10 +19,13 @@ harness. See the top-level task guardrails.
 | `constrained_sampler.py` | Exact constrained-canvas sampler: log-space forward/backward DP → `marginals`, `sample`, `greedy` (Viterbi/MAP), `log_partition`, `fixed_positions`, impossibility detection. **O(L) sequential.** |
 | `denoise_loop.py` | Multi-step constrained denoising loop (confidence-based schedule, re-solving as positions are committed). Verified exact via chain rule. |
 | `parallel_sampler.py` | **Log-depth (O(log L)) parallel sampler** — the paper's novelty (Dang & Ermon Alg. 1): log-semiring segment tree of transition-matrix products + top-down midpoint-state recursion. Same distribution as the sequential sampler. |
+| `gpu_constrained_sampler.py` | **Batched torch/GPU** implementation of the log-depth sampler (scatter-logsumexp + level-batched log-matmul tree). Numerically exact vs the numpy reference; benchmarked on an A40. |
+| `regex_dfa.py` | **Schema compiler:** regex → Thompson NFA → char-DFA → **token-level DFA** (`finite_automaton.DFA`). Verified exact vs Python `re`. |
+| `schema_compiler.py` | Restricted **JSON-schema → regex → token DFA** (+ trailing PAD for a fixed-length canvas). |
 | `brute_force_oracle.py` | Exhaustive-enumeration ground truth for tiny cases. |
 | `LOGDEPTH_PLAN.md` | Phase-2 plan mapping the paper's Algorithm 1 to `parallel_sampler.py`. |
 | `GPU_VALIDATION.md` | Real Dream-7B logit results (single-step; the multi-step loop confirmed separately). |
-| `tests/` | 46 seeded, CPU-only oracle tests (sampler 21, denoise loop 7, parallel sampler 18). |
+| `tests/` | 67 seeded oracle tests (sampler 21, denoise loop 7, parallel 18, schema 16, gpu 5). |
 | `model_adapters/` | Real-diffusion-logits bridge into the verified sampler (CPU-tested). |
 
 ## The problem the sampler solves
@@ -70,7 +73,7 @@ cd research/diffusion_structured_outputs
 ../../.venv/bin/python -m pytest tests/ -q
 ```
 
-Current result: **46 passed**. Coverage: exact-single-string DFA, multi-string DFA,
+Current result: **67 passed**. Coverage: exact-single-string DFA, multi-string DFA,
 regular pattern (parity), impossible constraint, compatible fixed token, impossible
 fixed token, highly-skewed logits, very-small probabilities, greedy == brute-force
 MAP, sampler-reproduces-exact-distribution (Monte Carlo), and the
@@ -100,8 +103,14 @@ every denoising step, so the independence holds only *within* a single step's
 predicted marginals. This is why the design (`design.md`) applies the DP per denoise
 step and re-solves as positions get fixed, rather than once.
 
-## Scope (explicitly out for the first milestone)
+## Scope
 
-Full JSON Schema, general CFGs, variable-length generation, multiple committed
-canvases, tool-call parsing, GPU kernels, and xgrammar internals are **out of scope**.
-The guard in `sampling_params.py:915` is **not** touched.
+Now covered (as CPU-validated references, GPU-benchmarked where noted): the exact +
+log-depth constrained samplers, a batched **torch/GPU** implementation, a multi-step
+denoise loop, and a **regular JSON-schema → token-DFA compiler**.
+
+Still **out of scope**: full JSON Schema and general CFGs (context-free — the LAVE
+direction), variable-length generation, multiple committed canvases, tool-call
+parsing, a production CUDA/Triton kernel, and DiffusionGemma-specific integration.
+The guard in `sampling_params.py:915` is **not** touched; nothing here is wired into
+production vLLM.
