@@ -103,44 +103,54 @@ def main() -> None:
     total_params = getattr(cfg, "num_parameters", None)
     print("\n[verdict]")
     ok = True
-    if is_nvfp4 and sm_major < 10:
-        ok = False
-        print("  NO-GO: checkpoint is NVFP4 (Blackwell sm100/sm120 format) but this")
-        print(
-            f"         GPU is compute cap {caps[0] if caps else '?'} (Ampere/Hopper)."
-        )
-        print("         NVFP4 kernels cannot run here. Use a bf16 checkpoint, or a")
-        print("         Blackwell GPU (RTX PRO 6000 / B200).")
+    if is_nvfp4:
+        # NVFP4 tensor cores are Blackwell-only (sm 10.0/12.0). Hopper (sm 9.0)
+        # has FP8 but not FP4; Ampere (sm 8.0) has neither.
+        if sm_major >= 10:
+            print("  NVFP4: native on this Blackwell GPU. OK.")
+        elif sm_major == 9:
+            ok = None  # review, not a hard no
+            print("  NVFP4 on Hopper (H100/H200, sm 9.0): NO NATIVE FP4 (Blackwell-")
+            print(
+                "    only). A dense NVFP4->bf16 Marlin dequant path may run, but this"
+            )
+            print("    is an NVFP4 *MoE* checkpoint and vLLM's NVFP4 MoE kernels are")
+            print("    SM120-targeted, so the expert GEMMs likely have no Hopper path.")
+            print("    Prefer a bf16 or FP8 checkpoint (FP8 IS native on Hopper). You")
+            print("    can try loading; vLLM will error clearly at model load if not.")
+        else:
+            ok = False
+            print("  NVFP4 on Ampere/older (sm < 9): NO-GO. No FP4 (nor FP8) tensor")
+            print("    cores. Use a bf16 checkpoint, or a Blackwell GPU.")
+
+    if is_nvfp4 and sm_major >= 10:
+        wbytes, dtype = 0.5, "nvfp4(~4bit)"
     else:
-        if is_nvfp4:
-            wbytes, dtype = 0.5, "nvfp4(~4bit)"
-        else:
-            wbytes, dtype = 2.0, "bf16/fp16"
-        if total_params:
-            wgb = total_params * wbytes / 1e9
-            print(
-                f"  weights ~{wgb:.1f} GB ({dtype}, {total_params / 1e9:.1f}B params)"
-            )
-            need = wgb + args.gpu_mem_headroom_gb
-            fits = need <= mem
-            ok = ok and fits
-            hr = args.gpu_mem_headroom_gb
-            verdict = "FITS" if fits else "TOO BIG"
-            print(
-                f"  need ~{need:.1f} GB (weights + {hr} GB headroom) "
-                f"vs {mem:.1f} GB avail -> {verdict}"
-            )
-        else:
-            print(f"  weights: dtype {dtype}; num_parameters not in config -- estimate")
-            print("    from the checkpoint safetensors total size on disk.")
-        if canvas_length is None:
-            print("  WARN: no canvas_length in config -> vLLM will NOT treat this as a")
-            print("        diffusion model; check you have the right checkpoint.")
+        # fits-check assumes the practical fallback: bf16 (fp8 would be ~half)
+        wbytes, dtype = 2.0, "bf16 (fp8 ~half)"
+    if total_params:
+        wgb = total_params * wbytes / 1e9
+        print(f"  weights ~{wgb:.1f} GB ({dtype}, {total_params / 1e9:.1f}B params)")
+        need = wgb + args.gpu_mem_headroom_gb
+        fits = need <= mem
+        ok = ok and fits
+        hr = args.gpu_mem_headroom_gb
+        verdict = "FITS" if fits else "TOO BIG"
         print(
-            f"  {'GO' if ok else 'REVIEW'}: proceed to dg_capture.py"
-            if ok
-            else "  REVIEW the above before capture."
+            f"  need ~{need:.1f} GB (weights + {hr} GB headroom) "
+            f"vs {mem:.1f} GB avail -> {verdict}"
         )
+    else:
+        print(f"  weights: dtype {dtype}; num_parameters not in config -- estimate")
+        print("    from the checkpoint safetensors total size on disk.")
+    if canvas_length is None:
+        print("  WARN: no canvas_length in config -> vLLM will NOT treat this as a")
+        print("        diffusion model; check you have the right checkpoint.")
+    print(
+        f"  {'GO' if ok else 'REVIEW'}: proceed to dg_capture.py"
+        if ok
+        else "  REVIEW the above before capture."
+    )
 
     print(f"\nNext: python dg_capture.py --model {args.model}")
 
