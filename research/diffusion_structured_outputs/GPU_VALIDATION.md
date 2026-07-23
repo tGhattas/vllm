@@ -104,6 +104,27 @@ token DFA (N=44 states, V=46):
   production kernel would be much faster. The value: the algorithm ports to batched
   device ops, matches the reference exactly, and scales with O(log L) depth.
 
+## Triton log-semiring matmul kernel
+
+The product tree's hot op is a log-semiring matmul `C[i,k] = logsumexp_j A[i,j] +
+B[j,k]`. `triton_logmm.py` implements it as a Triton kernel (one program per batch
+block; FlashAttention-style stable single-pass accumulation over j — running max +
+rescaled sum), installed into the sampler via `set_logmm_impl`. Validated + timed on
+the A40 (schema DFA N=44, B=512):
+
+| L | build_levels torch → triton | full sample torch → triton |
+| --- | --- | --- |
+| 64 | 93.5 → 23.4 ms (**4.0×**) | 124.1 → 53.5 ms (2.3×) |
+| 128 | 177.6 → 45.8 ms (**3.9×**) | 216.9 → 88.3 ms (2.5×) |
+| 256 | 351.0 → 90.9 ms (**3.9×**) | 411.6 → 151.4 ms (2.7×) |
+
+- Kernel vs torch reference: `max|Δ| ≈ 1e-6` (fp32), −inf pattern matches, over
+  N ∈ {8,33,64}; end-to-end logZ triton = numpy = 136.08158; all canvases accepted.
+- Bug found + fixed during bring-up: loads must be masked by `j < n` as well as
+  `i < n`, else padded contraction indices read past the block (OOB → illegal access
+  at large grids). Results were already correct (masked downstream); the fix removes
+  the OOB read.
+
 ## Caveats / not yet done
 
 - All GPU work used **Dream-v0-Base-7B only** — not a second small diffusion model,

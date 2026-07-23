@@ -75,13 +75,26 @@ def transition_matrices(
     return M
 
 
+# Optional drop-in log-semiring matmul (e.g. the Triton kernel in triton_logmm.py).
+# Set via set_logmm_impl(); used for CUDA tensors, else the torch fallback runs.
+_LOGMM_IMPL = None
+
+
+def set_logmm_impl(fn) -> None:
+    """Install a custom ``(A, B) -> C`` log-semiring matmul (Triton kernel, etc.)."""
+    global _LOGMM_IMPL
+    _LOGMM_IMPL = fn
+
+
 def _logmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Batched log-semiring matmul: C[...,i,k] = logsumexp_j a[...,i,j] + b[...,j,k].
 
-    Accumulates over the contraction index j with ``logaddexp`` so peak memory is
-    O(...·N²) instead of the O(...·N³) of a materialized outer sum — essential
-    when N (automaton states) is non-trivial.
+    Uses the installed kernel for CUDA tensors if present; otherwise accumulates
+    over the contraction index j with ``logaddexp`` so peak memory is O(...·N²)
+    instead of the O(...·N³) of a materialized outer sum.
     """
+    if _LOGMM_IMPL is not None and a.is_cuda:
+        return _LOGMM_IMPL(a, b)
     n = a.shape[-1]
     out = a[..., :, 0:1] + b[..., 0:1, :]  # j = 0
     for j in range(1, n):
