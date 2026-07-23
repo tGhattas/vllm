@@ -100,6 +100,27 @@ committed vLLM code; the `sampling_params.py:915` guard stays).
 
 ---
 
+## Verified on RTX PRO 6000 Blackwell (sm_120, native NVFP4)
+
+Real run of `nvidia/diffusiongemma-26B-A4B-it-NVFP4` (public, `modelopt_fp4`,
+canvas_length 256, vocab 262144, 128 experts). The verified constrained sampler ran
+on **real captured logits** `[8, 262144]`: unconstrained argmax was
+`' Fits Fits Fits ...'`; the digits-only DFA gave `99999999` (greedy) /
+`99959999` (sample) — all digits, DFA-accepted. Non-obvious fixes learned:
+
+- **torch must match the precompiled `_C`'s CUDA.** `uv pip install -e .
+  --torch-backend=auto` pulled torch **cu128**, but the precompiled vLLM `_C` needs
+  **CUDA 13** → `ImportError: libcudart.so.13`. Fix: reinstall torch **cu130**
+  (`--index-url https://download.pytorch.org/whl/cu130`). The Blackwell driver (580)
+  supports CUDA 13.
+- **nvrtc path:** `libnvrtc.so.13` ships under `.../site-packages/nvidia/cu13/lib/`
+  (non-standard). Add that dir to `LD_LIBRARY_PATH` or you get an `ImportError` (seen
+  during cumem/shutdown).
+- **Capture needs in-process execution.** vLLM V1 runs the model in a separate
+  `EngineCore` subprocess, so a `compute_logits` monkeypatch in the launcher never
+  fires. Run capture with **`VLLM_ENABLE_V1_MULTIPROCESSING=0`**. dg_capture.py hooks
+  both `compute_logits` and `DiffusionSampler.__call__` (vocab-dim filter).
+
 ## What must stay true (correctness)
 
 - Every constrained canvas is DFA-accepted (guaranteed by construction; assert it).

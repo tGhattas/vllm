@@ -49,17 +49,46 @@ def main() -> None:
     cls = dgmod.DiffusionGemmaForConditionalGeneration
     captured: list[np.ndarray] = []
     shapes: list[tuple] = []
-    _orig = cls.compute_logits
 
-    def _hook(self, *a, **k):
-        logits = _orig(self, *a, **k)
-        if logits is not None and len(captured) < args.num_capture:
-            arr = logits.detach().float().cpu().numpy()
-            captured.append(arr)
-            shapes.append(tuple(arr.shape))
-        return logits
+    # NOTE: vLLM V1 runs the model in a separate EngineCore subprocess, so a
+    # monkeypatch here only fires if the engine runs IN-PROCESS. Launch with
+    # VLLM_ENABLE_V1_MULTIPROCESSING=0 (see run script) for the hook to work.
+    def _capture(x, where):
+        import torch as _t
 
-    cls.compute_logits = _hook  # install hook
+        if (
+            not isinstance(x, _t.Tensor)
+            or x.ndim < 2
+            or len(captured) >= args.num_capture
+        ):
+            return
+        if x.shape[-1] < 1000:  # not a logits-over-vocab tensor
+            return
+        arr = x.detach().float().cpu().numpy()
+        captured.append(arr)
+        shapes.append((where, tuple(arr.shape)))
+
+    # Hook the model's compute_logits (per-position logits over the canvas).
+    _orig_cl = cls.compute_logits
+
+    def _cl_hook(self, *a, **k):
+        out = _orig_cl(self, *a, **k)
+        _capture(out, "compute_logits")
+        return out
+
+    cls.compute_logits = _cl_hook
+
+    # Fallback: hook DiffusionSampler.__call__ and grab its logits argument.
+    ds = getattr(dgmod, "DiffusionSampler", None)
+    if ds is not None:
+        _orig_ds = ds.__call__
+
+        def _ds_hook(self, *a, **k):
+            for x in list(a) + list(k.values()):
+                _capture(x, "DiffusionSampler")
+            return _orig_ds(self, *a, **k)
+
+        ds.__call__ = _ds_hook
 
     # #### diffusion_config may be auto-derived from the HF config's canvas_length;
     # pass explicitly only if construction complains.

@@ -49,10 +49,12 @@ def load_logits(args) -> np.ndarray:
 
 
 def digit_token_ids(tok) -> list[int]:
+    # ASCII 0-9 only (str.isdigit() would also match Unicode digits from many
+    # scripts, giving a noisy demo); single-character surface tokens.
     out = []
     for tokstr, tid in tok.get_vocab().items():
         core = tokstr.replace("Ġ", "").replace("Ċ", "").replace("▁", "")
-        if len(core) == 1 and core.isdigit():
+        if len(core) == 1 and core in "0123456789":
             out.append(int(tid))
     return sorted(out)
 
