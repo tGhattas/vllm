@@ -33,31 +33,36 @@ if HAS_TRITON:
 
     @triton.jit
     def _logmm_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
-        # N is constexpr so the contraction loop runs exactly N (not BLOCK) times,
-        # and addresses offs*N + j stay in-block for offs < N, j < N (no OOB).
+        # Two-pass log-semiring matmul in log2 space: pass 1 finds the per-(i,k)
+        # max (no exp/rescale, breaking the online-softmax loop-carried chain),
+        # pass 2 sums a single hardware exp2 per term. LOG2E is folded into the
+        # per-j loads so the N*N inner path has no multiply. exp2/log2 hit the same
+        # SFU primitives as exp/log (2^(LOG2E*x)=e^x), so this is exact to fp32 ULP.
+        # N is constexpr => loop runs exactly N times, addresses stay in-block.
+        LOG2E: tl.constexpr = 1.4426950408889634
+        LN2: tl.constexpr = 0.6931471805599453
         pid = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
         mask = offs < N
         blk = N * N
         a_base = a_ptr + pid * blk
         b_base = b_ptr + pid * blk
-
         neg_inf = float("-inf")
+
         m = tl.full((BLOCK, BLOCK), neg_inf, tl.float32)
-        s = tl.zeros((BLOCK, BLOCK), tl.float32)
-
         for j in range(0, N):
-            aj = tl.load(a_base + offs * N + j, mask=mask, other=neg_inf)  # A[:, j]
-            bj = tl.load(b_base + j * N + offs, mask=mask, other=neg_inf)  # B[j, :]
-            t = aj[:, None] + bj[None, :]
-            new_m = tl.maximum(m, t)
-            finite = new_m != neg_inf
-            corr = tl.where(finite, tl.exp(m - new_m), 0.0)
-            tt = tl.where(finite, tl.exp(t - new_m), 0.0)
-            s = s * corr + tt
-            m = new_m
+            aj = tl.load(a_base + offs * N + j, mask=mask, other=neg_inf) * LOG2E
+            bj = tl.load(b_base + j * N + offs, mask=mask, other=neg_inf) * LOG2E
+            m = tl.maximum(m, aj[:, None] + bj[None, :])
 
-        out = tl.where(m != neg_inf, m + tl.log(s), neg_inf)
+        ms = tl.where(m == neg_inf, 0.0, m)  # avoid -inf - -inf = NaN in pass 2
+        s = tl.zeros((BLOCK, BLOCK), tl.float32)
+        for j in range(0, N):
+            aj = tl.load(a_base + offs * N + j, mask=mask, other=neg_inf) * LOG2E
+            bj = tl.load(b_base + j * N + offs, mask=mask, other=neg_inf) * LOG2E
+            s += tl.math.exp2(aj[:, None] + bj[None, :] - ms)
+
+        out = tl.where(m == neg_inf, neg_inf, (m + tl.math.log2(s)) * LN2)
         c_base = c_ptr + pid * blk
         store_mask = mask[:, None] & mask[None, :]
         tl.store(c_base + offs[:, None] * N + offs[None, :], out, mask=store_mask)

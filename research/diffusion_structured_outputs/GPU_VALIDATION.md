@@ -109,14 +109,14 @@ token DFA (N=44 states, V=46):
 The product tree's hot op is a log-semiring matmul `C[i,k] = logsumexp_j A[i,j] +
 B[j,k]`. `triton_logmm.py` implements it as a Triton kernel (one program per batch
 block; FlashAttention-style stable single-pass accumulation over j — running max +
-rescaled sum), installed into the sampler via `set_logmm_impl`. Validated + timed on the A40 (schema DFA N=44, B=512), **after** the
+rescaled sum), installed into the sampler via `set_logmm_impl`. Validated + timed on the A40 (schema DFA N=44, B=512), **after** the two rounds of
 profiling-driven optimization below:
 
 | L | build_levels torch → triton | full sample torch → triton |
 | --- | --- | --- |
-| 64 | 83.7 → 10.2 ms (**8.2×**) | 93.0 → 19.6 ms (**4.8×**) |
-| 128 | 167.7 → 20.4 ms (**8.2×**) | 184.2 → 36.8 ms (**5.0×**) |
-| 256 | 335.5 → 40.8 ms (**8.2×**) | 367.1 → 72.4 ms (**5.1×**) |
+| 64 | 83.6 → 6.8 ms (**12.3×**) | 87.9 → 11.0 ms (**8.0×**) |
+| 128 | 167.6 → 13.5 ms (**12.4×**) | 174.4 → 19.9 ms (**8.8×**) |
+| 256 | 336.3 → 26.9 ms (**12.5×**) | 347.8 → 38.3 ms (**9.1×**) |
 
 - Kernel vs torch reference: `max|Δ| ≈ 1e-6` (fp32), −inf pattern matches, over
   N ∈ {8,33,64}; end-to-end logZ triton = numpy = 136.08158; all canvases accepted.
@@ -139,6 +139,28 @@ Per-stage timing of `sample()` (L=128, B=512) first showed **build_levels 62%**,
    `num_warps` to 8: build_levels 44.9 → 20.4 ms (the ~4× kernel became ~8× vs torch).
 
 Remaining split (L=256): build_levels 56%, transition_matrices 38%, sampling 6%.
+
+### Round 2 (design-panel driven, `scripts/profile_deep.py`)
+
+A finer profile (per-level tree, transition sub-steps) plus a multi-agent design
+panel (5 lenses → adversarial correctness verification) drove two more, both
+verified exact (logZ vs numpy rtol ~1e-7, all canvases accepted):
+
+1. **transition_matrices — compact-bucket scatter.** Scatter the E=172 edges into
+   only the **D=52 distinct** destination cells (`torch.unique`), then place those
+   columns into a dense −inf `M`, instead of scattering into all N²=1936 cells (97%
+   permanently −inf). Kills the two ~1 GB scratch tensors inside `_scatter_logsumexp`.
+   **Bit-exact** (`torch.equal(new_M, old_M)` including −inf). 27.6 → 7.6 ms (L=256).
+2. **build_levels — exp2/log2 two-pass kernel.** Replaced the online-softmax loop
+   (2 `exp` + rescale + loop-carried dependency per j) with two-pass max-then-sum in
+   log2 space using hardware `exp2`, with `LOG2E` folded into the loads so the N×N
+   inner path has no multiply. Exact to fp32 ULP (`2^(LOG2E·x)=e^x`). 40.8 → 26.9 ms
+   (L=256); the kernel went from ~8× to **12.5×** vs the torch reference.
+
+**Full `sample()` 72 → 38 ms (L=256), ~1.9× on top of round 1** (~9× vs the torch
+baseline; ~13,400 canvases/s). The panel's Rank-3 (persistent `M` buffer + per-DFA
+plan cache) was declined: smallest incremental win (~2.5 ms) with the highest
+correctness risk (a reproduced L-vs-Lpad keying bug that silently corrupts padding).
 
 ## Caveats / not yet done
 

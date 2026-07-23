@@ -70,8 +70,16 @@ def transition_matrices(
     next_state = next_state.to(log_probs.device)
     s_idx, v_idx = (next_state >= 0).nonzero(as_tuple=True)  # [E] edges
     dst_flat = s_idx * N + next_state[s_idx, v_idx]  # [E] into [N*N]
+    # Scatter into only the D distinct destination cells (D << N*N; the rest of M
+    # is permanently -inf), then place those columns into a single dense -inf M.
+    # This avoids materializing the ~O(B*L*N*N) scratch inside _scatter_logsumexp.
+    uniq_cell, inv = torch.unique(dst_flat, return_inverse=True)  # [D], [E]
     vals = log_probs[:, :, v_idx]  # [B, L, E]
-    flat = _scatter_logsumexp(vals, dst_flat, N * N)  # [B, L, N*N]
+    comp = _scatter_logsumexp(vals, inv, int(uniq_cell.numel()))  # [B, L, D]
+    flat = torch.full(
+        (B, L, N * N), NEG_INF, device=log_probs.device, dtype=log_probs.dtype
+    )
+    flat[:, :, uniq_cell] = comp
     return flat.reshape(B, L, N, N)
 
 
