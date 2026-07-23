@@ -32,24 +32,23 @@ except Exception:  # pragma: no cover - exercised only on CPU-only hosts
 if HAS_TRITON:
 
     @triton.jit
-    def _logmm_kernel(a_ptr, b_ptr, c_ptr, n, stride_blk, BLOCK: tl.constexpr):
+    def _logmm_kernel(a_ptr, b_ptr, c_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+        # N is constexpr so the contraction loop runs exactly N (not BLOCK) times,
+        # and addresses offs*N + j stay in-block for offs < N, j < N (no OOB).
         pid = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
-        mask = offs < n
-        a_base = a_ptr + pid * stride_blk
-        b_base = b_ptr + pid * stride_blk
+        mask = offs < N
+        blk = N * N
+        a_base = a_ptr + pid * blk
+        b_base = b_ptr + pid * blk
 
         neg_inf = float("-inf")
         m = tl.full((BLOCK, BLOCK), neg_inf, tl.float32)
         s = tl.zeros((BLOCK, BLOCK), tl.float32)
 
-        for j in range(0, BLOCK):
-            # aj = A[:, j]  (a row of length N over i); bj = B[j, :] (over k).
-            # Mask by j < n too: for padded j the address offs*n + j would run
-            # past the block's n*n elements (OOB) even though the value is unused.
-            jmask = mask & (j < n)
-            aj = tl.load(a_base + offs * n + j, mask=jmask, other=neg_inf)
-            bj = tl.load(b_base + j * n + offs, mask=jmask, other=neg_inf)
+        for j in range(0, N):
+            aj = tl.load(a_base + offs * N + j, mask=mask, other=neg_inf)  # A[:, j]
+            bj = tl.load(b_base + j * N + offs, mask=mask, other=neg_inf)  # B[j, :]
             t = aj[:, None] + bj[None, :]
             new_m = tl.maximum(m, t)
             finite = new_m != neg_inf
@@ -59,9 +58,9 @@ if HAS_TRITON:
             m = new_m
 
         out = tl.where(m != neg_inf, m + tl.log(s), neg_inf)
-        c_base = c_ptr + pid * stride_blk
+        c_base = c_ptr + pid * blk
         store_mask = mask[:, None] & mask[None, :]
-        tl.store(c_base + offs[:, None] * n + offs[None, :], out, mask=store_mask)
+        tl.store(c_base + offs[:, None] * N + offs[None, :], out, mask=store_mask)
 
 
 def logmm_semiring(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -80,5 +79,6 @@ def logmm_semiring(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     bk = a2.shape[0]
     c2 = torch.empty_like(a2)
     block = triton.next_power_of_2(n)
-    _logmm_kernel[(bk,)](a2, b2, c2, n, n * n, BLOCK=block)
+    num_warps = 8 if block >= 64 else 4
+    _logmm_kernel[(bk,)](a2, b2, c2, N=n, BLOCK=block, num_warps=num_warps)
     return c2.reshape(*lead, n, n).to(a.dtype)

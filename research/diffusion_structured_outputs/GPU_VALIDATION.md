@@ -109,14 +109,14 @@ token DFA (N=44 states, V=46):
 The product tree's hot op is a log-semiring matmul `C[i,k] = logsumexp_j A[i,j] +
 B[j,k]`. `triton_logmm.py` implements it as a Triton kernel (one program per batch
 block; FlashAttention-style stable single-pass accumulation over j — running max +
-rescaled sum), installed into the sampler via `set_logmm_impl`. Validated + timed on
-the A40 (schema DFA N=44, B=512):
+rescaled sum), installed into the sampler via `set_logmm_impl`. Validated + timed on the A40 (schema DFA N=44, B=512), **after** the
+profiling-driven optimization below:
 
 | L | build_levels torch → triton | full sample torch → triton |
 | --- | --- | --- |
-| 64 | 93.5 → 23.4 ms (**4.0×**) | 124.1 → 53.5 ms (2.3×) |
-| 128 | 177.6 → 45.8 ms (**3.9×**) | 216.9 → 88.3 ms (2.5×) |
-| 256 | 351.0 → 90.9 ms (**3.9×**) | 411.6 → 151.4 ms (2.7×) |
+| 64 | 83.7 → 10.2 ms (**8.2×**) | 93.0 → 19.6 ms (**4.8×**) |
+| 128 | 167.7 → 20.4 ms (**8.2×**) | 184.2 → 36.8 ms (**5.0×**) |
+| 256 | 335.5 → 40.8 ms (**8.2×**) | 367.1 → 72.4 ms (**5.1×**) |
 
 - Kernel vs torch reference: `max|Δ| ≈ 1e-6` (fp32), −inf pattern matches, over
   N ∈ {8,33,64}; end-to-end logZ triton = numpy = 136.08158; all canvases accepted.
@@ -124,6 +124,21 @@ the A40 (schema DFA N=44, B=512):
   `i < n`, else padded contraction indices read past the block (OOB → illegal access
   at large grids). Results were already correct (masked downstream); the fix removes
   the OOB read.
+
+### Profiling → optimization (`scripts/profile_gpu_sampler.py`)
+
+Per-stage timing of `sample()` (L=128, B=512) first showed **build_levels 62%**,
+**transition_matrices 33%**, state-fill + emit ~5%. Two fixes roughly halved full
+`sample()` (71 → 37 ms at L=128):
+
+1. **transition_matrices** — replaced the Python loop over N states (N sequential
+   scatters) with a **single edge-based scatter** over the DFA's defined transitions
+   (here 172 edges): 23.7 → 14.0 ms.
+2. **Triton kernel** — made `N` a `constexpr` so the contraction loop runs exactly
+   `N` (not `BLOCK=64`) times, dropping ~20 masked iterations per step, and raised
+   `num_warps` to 8: build_levels 44.9 → 20.4 ms (the ~4× kernel became ~8× vs torch).
+
+Remaining split (L=256): build_levels 56%, transition_matrices 38%, sampling 6%.
 
 ## Caveats / not yet done
 

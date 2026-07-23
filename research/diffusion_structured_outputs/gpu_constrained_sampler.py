@@ -59,20 +59,20 @@ def _scatter_logsumexp(vals: torch.Tensor, index: torch.Tensor, n: int) -> torch
 def transition_matrices(
     log_probs: torch.Tensor, next_state: torch.Tensor
 ) -> torch.Tensor:
-    """Per-position log transition matrices M [B, L, N, N]."""
+    """Per-position log transition matrices M [B, L, N, N].
+
+    One edge-based scatter over the DFA's defined transitions (typically far
+    fewer than N·V), instead of a Python loop over states: for each edge
+    (s, v) → s', route log_probs[..., v] into flat bucket s·N + s'.
+    """
     B, L, V = log_probs.shape
     N = next_state.shape[0]
-    M = torch.full(
-        (B, L, N, N), NEG_INF, device=log_probs.device, dtype=log_probs.dtype
-    )
-    for s in range(N):
-        idx = next_state[s]  # [V]
-        valid = idx >= 0
-        if not bool(valid.any()):
-            continue
-        vv = valid.nonzero(as_tuple=True)[0]
-        M[:, :, s, :] = _scatter_logsumexp(log_probs[:, :, vv], idx[vv], N)
-    return M
+    next_state = next_state.to(log_probs.device)
+    s_idx, v_idx = (next_state >= 0).nonzero(as_tuple=True)  # [E] edges
+    dst_flat = s_idx * N + next_state[s_idx, v_idx]  # [E] into [N*N]
+    vals = log_probs[:, :, v_idx]  # [B, L, E]
+    flat = _scatter_logsumexp(vals, dst_flat, N * N)  # [B, L, N*N]
+    return flat.reshape(B, L, N, N)
 
 
 # Optional drop-in log-semiring matmul (e.g. the Triton kernel in triton_logmm.py).
@@ -158,20 +158,31 @@ def sample(
     sequential/log-depth samplers). Raises if any batch element is unsatisfiable.
     """
     device = log_probs.device
+    next_state = next_state.to(device)
+    M = transition_matrices(log_probs, next_state)
+    levels = build_levels(M)
+    return sample_from_levels(
+        log_probs, levels, next_state, accepting_mask, start, generator
+    )
+
+
+def sample_from_levels(
+    log_probs: torch.Tensor,
+    levels: list[torch.Tensor],
+    next_state: torch.Tensor,
+    accepting_mask: torch.Tensor,
+    start: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample canvases given a prebuilt product tree (state fill + token emission)."""
+    device = log_probs.device
     if generator is None:
         generator = torch.Generator(device=device)
     B, L, V = log_probs.shape
     N = next_state.shape[0]
     next_state = next_state.to(device)
     accepting_mask = accepting_mask.to(device)
-
-    M = transition_matrices(log_probs, next_state)
-    levels = build_levels(M)
     Lpad = levels[0].shape[1]
-
-    logZ = log_partition(levels, start, accepting_mask)
-    if bool(torch.isinf(logZ).any() and (logZ == NEG_INF).any()):
-        raise ValueError("some batch element has no accepted canvas (logZ = -inf)")
 
     z = torch.zeros((B, Lpad + 1), dtype=torch.long, device=device)
     z[:, 0] = start
@@ -179,6 +190,8 @@ def sample(
     root = levels[-1][:, 0]
     w_end = root[:, start, :]
     w_end = torch.where(accepting_mask, w_end, torch.full_like(w_end, NEG_INF))
+    if bool((torch.logsumexp(w_end, dim=-1) == NEG_INF).any()):
+        raise ValueError("some batch element has no accepted canvas (logZ = -inf)")
     z[:, Lpad] = _gumbel_argmax(w_end, generator)
 
     depth = len(levels) - 1
