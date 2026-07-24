@@ -972,7 +972,13 @@ class EngineCore:
             # sampling_params.structured_outputs), not the autoregressive grammar
             # FSM. Detach the AR structured-output state so none of the
             # grammar/bitmask/FSM-advance machinery engages for these requests.
+            # Request.__init__ parks structured-output requests in
+            # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR pending grammar compilation;
+            # with the grammar detached the scheduler would never promote them, so
+            # reset the status to WAITING so the request schedules normally.
             req.structured_output_request = None
+            if req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                req.status = RequestStatus.WAITING
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

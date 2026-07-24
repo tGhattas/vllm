@@ -120,31 +120,39 @@ Notes: fp32 DP over `[num_decode, CL, V]` adds a transient — computed over the
 ~thousands of relevant token columns and scattered to full-V once
 (`constrained_log_marginals`), ~20 ms/call at CL=256.
 
-### Per-request via the normal API (regex / choice) — status
+### Per-request via the normal API (regex / choice) — WORKING
 
-Wired end to end (commits d100ce710 → 056be7154): the guard allows `regex`/`choice`
-for diffusion, `core.py` detaches `structured_output_request` so the AR grammar
-machinery is bypassed, `DiffusionSampler.add_request` compiles+caches a per-slot
-`DiffusionConstraint` from `sampling_params.structured_outputs`, and `__call__`
-applies it per decode row. The compiler and marginals are oracle-exact (unit
-tests). Usage:
+Wired end to end (commits d100ce710 → 056be7154, fixed 2026-07-24): the guard
+allows `regex`/`choice` for diffusion, `core.py` detaches
+`structured_output_request` so the AR grammar machinery is bypassed,
+`DiffusionSampler.add_request` compiles+caches a per-slot `DiffusionConstraint`
+from `sampling_params.structured_outputs`, and `__call__` applies it per decode
+row. The compiler and marginals are oracle-exact (unit tests). Usage:
 
 ```python
 from vllm.sampling_params import StructuredOutputsParams as SO
 SamplingParams(temperature=1.0, structured_outputs=SO(regex=r"..."))   # or choice=[...]
 ```
 
-**Known issue (open):** the *runtime* constraint compile — `get_vocab()` +
-`convert_tokens_to_string` over the 262k vocab through the **serving tokenizer
-wrapper on the worker** — stalls the engine, even though the same scan is ~0.3 s
-in a standalone process and the DFA build is ~0.2 s. So the per-request path is
-not yet usable end-to-end. The **precompiled-file path works** (3 s, valid JSON —
-see above), which proves the sampler/marginals mechanism; the fix is to compile
-the DFA **off the worker hot-path** — in the engine-core input thread with the
-fast tokenizer (as the AR `StructuredOutputManager` does), threading the compiled
-edge list to the worker via `NewRequestData`, or precompiling per distinct spec.
-Also open (design.md §5): feed the diffusion convergence/confidence check the
-constrained marginals so a peaked constraint doesn't slow commit.
+**Verified end-to-end on the RTX PRO 6000 Blackwell** with
+`nvidia/diffusiongemma-26B-A4B-it-NVFP4` and
+`regex=r'\{"active":(true|false),"age":-?(0|[1-9][0-9]*)\}'`: output
+`{"active":false,"age":5}` — valid JSON, regex-conformant, ~3.3 s, clean exit. The
+per-slot compile is **0.37 s** (33 states, 179 edges); marginals ~20–27 ms/step.
+
+**Root-cause note (the earlier "runtime compile stalls the engine" was a
+misdiagnosis).** `py-spy` was ptrace-blocked in the pod container; a
+`faulthandler.register(SIGUSR1)` stack dump showed the engine spinning at 99 % CPU
+in a normal `LLMEngine.step` loop that never terminated — the request was never
+dispatched to the diffusion runner. The compile was never slow (0.37 s via *both*
+the raw and the `CachedGemmaTokenizer` serving wrapper). The real bug:
+`Request.__init__` parks any request with `structured_output_request is not None`
+in `WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR`; the `core.py` bypass detached the
+grammar but left that status, and the scheduler only promotes out of it when
+`structured_output_req and structured_output_req.grammar` — now `None`, so it
+never scheduled. Fix (`core.py`, right after the detach): reset the status to
+`WAITING`. Still open (design.md §5): feed the diffusion convergence/confidence
+check the constrained marginals so a peaked constraint doesn't slow commit.
 
 ---
 

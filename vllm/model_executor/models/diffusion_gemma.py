@@ -17,6 +17,7 @@ via Gemma4MultimodalEmbedder.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
@@ -1151,9 +1152,8 @@ class DiffusionSampler:
                 from vllm.tokenizers import cached_tokenizer_from_config
 
                 self._tokenizer = cached_tokenizer_from_config(self._model_config)
-            import time as _time
 
-            _t0 = _time.time()
+            t0 = time.time()
             con = DiffusionConstraint.from_structured_outputs(
                 so, self._tokenizer, self.vocab_size
             )
@@ -1164,7 +1164,7 @@ class DiffusionSampler:
                 key,
                 con.N,
                 int(con.edge_s.numel()),
-                _time.time() - _t0,
+                time.time() - t0,
             )
         self._req_constraints[req_idx] = con
 
