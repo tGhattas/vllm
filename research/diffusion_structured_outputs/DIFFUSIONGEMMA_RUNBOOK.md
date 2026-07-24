@@ -88,15 +88,38 @@ on real DiffusionGemma logits.*
  "order":["name","age","active"]}
 ```
 
-## 5. (Next) In-denoising-loop prototype — NOT in these scripts yet
+## 5. In-denoising-loop guided decoding — INTEGRATED (flag-gated)
 
-Once step 4 confirms real logits flow through the sampler, the option-(c) prototype
-is a runtime monkeypatch of `DiffusionSampler` / `_compiled_sample_step`
-(`diffusion_gemma.py:471`) that, for a single opt-in request, replaces the raw
-per-position `probs` with the constrained marginals between `probs` computation
-(`:539-543`) and the accept/renoise decision (`:560-583`) — see `design.md` §2, §6.
-Do this only after step 4 is green; keep it a script-level monkeypatch (do NOT edit
-committed vLLM code; the `sampling_params.py:915` guard stays).
+Option (c) is now integrated into vLLM behind an opt-in flag (default off; the
+`sampling_params.py:915` guard is untouched):
+
+- `vllm/model_executor/models/diffusion_constraint.py` — `DiffusionConstraint`
+  reweights canvas logits to the constrained marginals `P_D(x_i=v)` (oracle-verified).
+- `diffusion_gemma.py` `DiffusionSampler.__call__` — when
+  `VLLM_DIFFUSION_CONSTRAINT` points at a precompiled constraint file, replaces the
+  canvas logits with those marginals before the compiled sample step, steering every
+  denoising step toward a DFA-accepted canvas.
+
+Build the constraint + run it:
+
+```bash
+python scripts/build_constraint.py --model <repo> --schema person.json \
+    --vocab-size 262144 --out /workspace/person_constraint.pt
+VLLM_DIFFUSION_CONSTRAINT=/workspace/person_constraint.pt \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+LD_LIBRARY_PATH=.../nvidia/cu13/lib:$LD_LIBRARY_PATH \
+  python gen.py   # LLM(...).generate(...)
+```
+
+**Verified on the RTX PRO 6000 Blackwell** with `nvidia/diffusiongemma-26B-A4B-it-
+NVFP4` and schema `{"active":boolean,"age":integer}` (33-state DFA, 179 edges):
+baseline output `''`; **constrained output `{"active":true,"age":6}`** — valid JSON,
+schema-conformant, from the real NVFP4 model.
+
+Notes: fp32 DP over `[num_decode, CL, V]` adds a transient (~1.5 GB at CL=256,
+batch 1) — lower `--gpu-memory-utilization` if tight. Per-request constraints (vs
+the engine-wide env flag) and the joint-sample hardening for a guaranteed-valid
+commit are the natural follow-ups; see `design.md`.
 
 ---
 
