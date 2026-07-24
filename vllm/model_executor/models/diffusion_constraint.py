@@ -246,23 +246,16 @@ def _regex_charset(pat: str) -> set[str] | None:
 def _relevant_tokens(tokenizer, charset: set[str]) -> tuple[list[int], list[str]]:
     """Vocab tokens whose surface is non-empty and within `charset` (exact prune).
 
-    Two-pass so the (per-token) ``convert_tokens_to_string`` is called only on the
-    few candidates, not the whole vocab: pass 1 filters raw vocab pieces cheaply
-    (mapping the byte/SentencePiece space markers to a space); pass 2 decodes the
-    candidates for an exact surface + re-check. This keeps compile time bounded on
-    a 250k+ vocab.
+    Other tokens can never appear in an accepted canvas, so pruning to these is
+    exact. ``convert_tokens_to_string`` over the whole vocab is ~0.3 s even at
+    250k+ pieces, so no approximation is needed (an earlier raw-piece pre-filter
+    over-pruned the token set and hurt convergence).
     """
-    allowed = charset | {" "}  # a marker-mapped leading space is fine to pre-pass
-    cand = []
-    for piece, tid in tokenizer.get_vocab().items():
-        approx = piece.replace("▁", " ").replace("Ġ", " ").replace("Ċ", "\n")
-        if approx and all(ch in allowed for ch in approx):
-            cand.append((int(tid), piece))
     rel = []
-    for tid, piece in cand:
+    for piece, tid in tokenizer.get_vocab().items():
         s = tokenizer.convert_tokens_to_string([piece])
         if s and all(ch in charset for ch in s):
-            rel.append((tid, s))
+            rel.append((int(tid), s))
     rel.sort()
     return [t for t, _ in rel], [s for _, s in rel]
 

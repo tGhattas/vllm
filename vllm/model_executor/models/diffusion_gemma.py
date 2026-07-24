@@ -1151,11 +1151,21 @@ class DiffusionSampler:
                 from vllm.tokenizers import cached_tokenizer_from_config
 
                 self._tokenizer = cached_tokenizer_from_config(self._model_config)
+            import time as _time
+
+            _t0 = _time.time()
             con = DiffusionConstraint.from_structured_outputs(
                 so, self._tokenizer, self.vocab_size
             )
             self._constraint_cache[key] = con
-            logger.info("Compiled diffusion canvas constraint for %s", key)
+            logger.info(
+                "Compiled diffusion canvas constraint for %s: %d states, %d "
+                "edges in %.2fs",
+                key,
+                con.N,
+                int(con.edge_s.numel()),
+                _time.time() - _t0,
+            )
         self._req_constraints[req_idx] = con
 
     def apply_staged_writes(self) -> None:
