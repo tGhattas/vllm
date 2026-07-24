@@ -323,6 +323,10 @@ class DiffusionConstraint:
         self.edge_s = edge_s.long().contiguous()
         self.edge_v = edge_v.long().contiguous()
         self.edge_d = edge_d.long().contiguous()
+        # Relevant token columns (edges touch far fewer than V tokens); marginals
+        # are computed over these and scattered back, so the hot path never
+        # materializes O(B·L·V) intermediates.
+        self.rel_v, self.edge_v_local = torch.unique(self.edge_v, return_inverse=True)
 
     @classmethod
     def from_next_state(cls, next_state, accepting, start) -> DiffusionConstraint:
@@ -407,16 +411,23 @@ class DiffusionConstraint:
         self.edge_s = self.edge_s.to(device)
         self.edge_v = self.edge_v.to(device)
         self.edge_d = self.edge_d.to(device)
+        self.rel_v = self.rel_v.to(device)
+        self.edge_v_local = self.edge_v_local.to(device)
         return self
 
-    def _transition_matrices(self, logp: torch.Tensor) -> torch.Tensor:
-        """M[b,i,s,s'] = logsumexp over tokens v (s->s') of logp[b,i,v]; [B,L,N,N]."""
-        B, L, _ = logp.shape
+    def _transition_matrices(self, logp_rel: torch.Tensor) -> torch.Tensor:
+        """M[b,i,s,s'] = logsumexp over tokens v (s->s') of logp[b,i,v]; [B,L,N,N].
+
+        ``logp_rel`` is [B, L, U] over the relevant token columns; edges index it
+        via ``edge_v_local``.
+        """
+        B, L, _ = logp_rel.shape
         N = self.N
-        vals = logp[:, :, self.edge_v]  # [B, L, E]
-        flat = torch.full((B, L, N * N), NEG_INF, device=logp.device, dtype=logp.dtype)
+        vals = logp_rel[:, :, self.edge_v_local]  # [B, L, E]
+        flat = torch.full(
+            (B, L, N * N), NEG_INF, device=logp_rel.device, dtype=logp_rel.dtype
+        )
         idx = (self.edge_s * N + self.edge_d).view(1, 1, -1).expand(B, L, -1)
-        # scatter-logsumexp: max then log-sum-exp of shifted terms
         mx = torch.full_like(flat, NEG_INF)
         mx.scatter_reduce_(2, idx, vals, reduce="amax", include_self=True)
         ex = torch.exp(vals - mx.gather(2, idx))
@@ -438,51 +449,53 @@ class DiffusionConstraint:
     def constrained_log_marginals(self, logits: torch.Tensor) -> torch.Tensor:
         """Reweight ``logits`` [B, L, V] to constrained log-marginals [B, L, V].
 
-        Tokens with no DFA transition get ``-inf``. Positions of a request whose
-        constraint is unsatisfiable within L are left unchanged (logZ == -inf).
+        All heavy work is over the ``U`` relevant token columns (edges touch far
+        fewer than V tokens); the full-V result is a single scatter of those U
+        columns into a ``-inf`` tensor. Tokens with no DFA transition stay
+        ``-inf``; a request whose constraint is unsatisfiable within L (logZ ==
+        -inf) is left unchanged.
         """
         B, L, V = logits.shape
         N = self.N
-        logp = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-        M = self._transition_matrices(logp)  # [B, L, N, N]
+        rel = self.rel_v  # [U] relevant token ids
+        U = rel.shape[0]
+        dt = logits.dtype
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # [B, L, 1]
+        logp_rel = logits[:, :, rel] - lse  # [B, L, U]
+        M = self._transition_matrices(logp_rel)  # [B, L, N, N]
 
-        # forward alpha[i] and backward beta[i]
-        alpha = torch.full(
-            (B, L + 1, N), NEG_INF, device=logits.device, dtype=logp.dtype
-        )
+        alpha = torch.full((B, L + 1, N), NEG_INF, device=logits.device, dtype=dt)
         alpha[:, 0, self.start] = 0.0
         for i in range(L):
             alpha[:, i + 1] = self._logmv(alpha[:, i], M[:, i])
-        beta = torch.full(
-            (B, L + 1, N), NEG_INF, device=logits.device, dtype=logp.dtype
-        )
+        beta = torch.full((B, L + 1, N), NEG_INF, device=logits.device, dtype=dt)
         beta[:, L] = torch.where(
             self.accepting,
-            torch.zeros(N, device=logits.device),
-            torch.full((N,), NEG_INF, device=logits.device),
+            torch.zeros(N, device=logits.device, dtype=dt),
+            torch.full((N,), NEG_INF, device=logits.device, dtype=dt),
         )
         for i in range(L - 1, -1, -1):
             beta[:, i] = self._logmv_t(M[:, i], beta[:, i + 1])
 
-        logZ = beta[:, 0, self.start]  # [B]
-        ok = torch.isfinite(logZ)
+        ok = torch.isfinite(beta[:, 0, self.start])  # [B] logZ finite
 
-        # out[b,i,v] = logp[b,i,v] + logsumexp_s(alpha[b,i,s] + beta[b,i+1, d(s,v)]);
-        # accumulate per (b,i,v) over edges via scatter-logsumexp.
+        # per-edge weight alpha[b,i,edge_s] + beta[b,i+1,edge_d], accumulated per
+        # relevant token (edge_v_local) via scatter-logsumexp -> [B, L, U].
         E = self.edge_v.shape[0]
-        # weight per edge per (b,i): alpha[b,i,edge_s] + beta[b,i+1,edge_d]
-        a_e = alpha[:, :L][:, :, self.edge_s]  # [B, L, E]
-        b_e = beta[:, 1:][:, :, self.edge_d]  # [B, L, E]
-        w = a_e + b_e  # [B, L, E]
-        idxv = self.edge_v.view(1, 1, E).expand(B, L, E)
-        out = torch.full((B, L, V), NEG_INF, device=logits.device, dtype=logp.dtype)
-        mx = torch.full((B, L, V), NEG_INF, device=logits.device, dtype=logp.dtype)
-        mx.scatter_reduce_(2, idxv, w, reduce="amax", include_self=True)
-        ex = torch.exp(w - mx.gather(2, idxv))
-        sm = torch.zeros((B, L, V), device=logits.device, dtype=logp.dtype)
-        sm.scatter_add_(2, idxv, ex)
+        w = (
+            alpha[:, :L][:, :, self.edge_s] + beta[:, 1:][:, :, self.edge_d]
+        )  # [B, L, E]
+        idx = self.edge_v_local.view(1, 1, E).expand(B, L, E)
+        mx = torch.full((B, L, U), NEG_INF, device=logits.device, dtype=dt)
+        mx.scatter_reduce_(2, idx, w, reduce="amax", include_self=True)
+        ex = torch.exp(w - mx.gather(2, idx))
+        sm = torch.zeros((B, L, U), device=logits.device, dtype=dt)
+        sm.scatter_add_(2, idx, ex)
         acc = torch.where(sm > 0, mx + torch.log(sm), torch.full_like(mx, NEG_INF))
-        out = acc + logp  # add emission; -inf where no edge
-        # leave unsatisfiable requests unchanged
-        out = torch.where(ok.view(B, 1, 1), out, logits)
+        cu = acc + logp_rel  # [B, L, U] constrained logits at relevant tokens
+
+        out = torch.full((B, L, V), NEG_INF, device=logits.device, dtype=dt)
+        out[:, :, rel] = cu
+        if not bool(ok.all()):
+            out = torch.where(ok.view(B, 1, 1), out, logits)
         return out
