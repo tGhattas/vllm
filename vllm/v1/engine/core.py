@@ -966,6 +966,13 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if req.use_structured_output and self.vllm_config.model_config.is_diffusion:
+            # Diffusion models enforce structured outputs via canvas-aware
+            # constrained decoding in the sampler (from
+            # sampling_params.structured_outputs), not the autoregressive grammar
+            # FSM. Detach the AR structured-output state so none of the
+            # grammar/bitmask/FSM-advance machinery engages for these requests.
+            req.structured_output_request = None
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

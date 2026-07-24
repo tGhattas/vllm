@@ -13,6 +13,7 @@ import sys
 import constrained_sampler as cs
 import numpy as np
 import pytest
+import regex as _re
 import torch
 from finite_automaton import DFA
 from test_constrained_sampler import parity_dfa, random_logprobs
@@ -25,7 +26,26 @@ _VLLM_MODELS = os.path.join(
     "models",
 )
 sys.path.insert(0, _VLLM_MODELS)
-from diffusion_constraint import DiffusionConstraint  # noqa: E402
+from diffusion_constraint import (  # noqa: E402
+    DiffusionConstraint,
+    _regex_charset,
+    choice_to_regex,
+)
+
+
+class _FakeTok:
+    """Minimal tokenizer: single-char tokens 0-9 a-z + <eos>; surface == token."""
+
+    eos_token_id = 36
+
+    def get_vocab(self):
+        v = {str(i): i for i in range(10)}
+        v.update({chr(97 + i): 10 + i for i in range(26)})
+        v["<eos>"] = 36
+        return v
+
+    def convert_tokens_to_string(self, toks):
+        return "".join(toks)
 
 
 def _next_state(dfa: DFA) -> torch.Tensor:
@@ -96,3 +116,33 @@ def test_file_roundtrip(tmp_path):
     assert torch.allclose(
         con.constrained_log_marginals(x), con2.constrained_log_marginals(x)
     )
+
+
+@pytest.mark.parametrize("regex", ["[0-9]+", "a(b|c)*d", "-?(0|[1-9][0-9]*)"])
+def test_from_regex_produces_matching_output(regex):
+    tok = _FakeTok()
+    vocab = 37
+    con = DiffusionConstraint.from_regex(regex, tok, vocab)
+    inv = {i: s for s, i in tok.get_vocab().items()}
+    inv[tok.eos_token_id] = ""  # PAD/eos contributes nothing
+    logits = torch.tensor(
+        np.random.default_rng(0).normal(size=(1, 12, vocab)), dtype=torch.float64
+    )
+    ids = con.constrained_log_marginals(logits)[0].argmax(-1).tolist()
+    text = "".join(inv.get(t, "?") for t in ids)  # eos-run trimmed by ""
+    assert _re.fullmatch(regex, text), f"{text!r} not {regex!r}"
+
+
+def test_from_choice_and_charset():
+    assert choice_to_regex(["red", "green"]) == "(red|green)"
+    assert _regex_charset("(true|false)") is not None
+    assert _regex_charset(".*") is None and _regex_charset('"[^"]*"') is None
+    tok = _FakeTok()
+    con = DiffusionConstraint.from_choice(["ab", "cd"], tok, 37)
+    inv = {i: s for s, i in tok.get_vocab().items()}
+    inv[tok.eos_token_id] = ""
+    logits = torch.tensor(
+        np.random.default_rng(1).normal(size=(1, 6, 37)), dtype=torch.float64
+    )
+    ids = con.constrained_log_marginals(logits)[0].argmax(-1).tolist()
+    assert "".join(inv.get(t, "?") for t in ids) in ("ab", "cd")

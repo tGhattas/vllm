@@ -913,16 +913,33 @@ class SamplingParams(
             return
 
         if model_config.is_diffusion:
-            # Diffusion LLMs denoise a whole canvas of tokens in parallel
-            # rather than sampling left-to-right, which the grammar FSM
-            # requires. Without this check, requests fail mid-generation
-            # with an FSM rejection (HTTP 500). See issue #45436.
-            raise ValueError(
-                "Structured outputs are not yet supported for diffusion "
-                "language models. Remove the structured output constraint "
-                "(e.g. `response_format`, `structured_outputs`) from the "
-                "request."
-            )
+            # Diffusion LLMs denoise a whole canvas in parallel, so the
+            # autoregressive grammar FSM (advance-one-committed-token) does not
+            # apply. Instead they enforce structured outputs via canvas-aware
+            # constrained decoding in the sampler, which currently supports the
+            # regular subset (`regex` and `choice`). Other constraint types
+            # (`json`, `grammar`, `json_object`, `structural_tag`) can be
+            # non-regular and are not yet supported. See issues #45436, #45572.
+            so = self.structured_outputs
+            if (
+                so.json is not None
+                or so.grammar is not None
+                or so.json_object is not None
+                or so.structural_tag is not None
+            ):
+                raise ValueError(
+                    "Diffusion language models currently support only `regex` "
+                    "and `choice` structured outputs; `json`/`grammar` are not "
+                    "yet supported. See issue #45572."
+                )
+            if tokenizer is None:
+                raise ValueError(
+                    "Structured outputs requires a tokenizer so it can't be "
+                    "used with 'skip_tokenizer_init'"
+                )
+            # regex/choice are handled by the diffusion sampler, not the AR
+            # grammar backend; skip the backend selection below.
+            return
 
         if tokenizer is None:
             raise ValueError(

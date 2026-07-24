@@ -846,6 +846,7 @@ class DiffusionGemmaModelState(ModelState):
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
+            model_config=self.model_config,
             t_min=gen["t_min"],
             t_max=gen["t_max"],
             entropy_bound=entropy_bound,
@@ -1051,6 +1052,7 @@ class DiffusionSampler:
         diffusion_config: Any,
         vocab_size: int,
         diffusion_states: DiffusionGemmaRequestStates | None = None,
+        model_config: Any = None,
         *,
         confidence_threshold: float,
         t_min: float,
@@ -1087,6 +1089,15 @@ class DiffusionSampler:
         self.diffusion_states = diffusion_states
         self.entropy_bound = entropy_bound
 
+        # Per-request canvas-aware constrained decoding (regex/choice structured
+        # outputs). Compiled per slot in add_request from sampling_params;
+        # applied per decode row in __call__. Cache by constraint spec so the
+        # (vocab-scan) compile is paid once per distinct schema.
+        self._model_config = model_config
+        self._tokenizer = None
+        self._req_constraints: dict[int, Any] = {}
+        self._constraint_cache: dict[Any, Any] = {}
+
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
         self._sampled = torch.zeros(
@@ -1119,7 +1130,33 @@ class DiffusionSampler:
         # Purge any stale logprobs stashed under this slot by a prior request
         # that was aborted between its converging denoise and commit steps.
         self._pending_logprobs.pop(req_idx, None)
+        self._set_request_constraint(req_idx, sampling_params)
         self.sampling_states.add_request(req_idx, sampling_params)
+
+    def _set_request_constraint(self, req_idx: int, sampling_params: Any) -> None:
+        """Compile/cache the canvas constraint for this slot (regex/choice)."""
+        # Reset the slot (slots are reused across requests).
+        self._req_constraints.pop(req_idx, None)
+        so = getattr(sampling_params, "structured_outputs", None)
+        if so is None or (so.regex is None and so.choice is None):
+            return
+        key = so.regex if so.regex is not None else ("choice", tuple(so.choice))
+        con = self._constraint_cache.get(key)
+        if con is None:
+            from vllm.model_executor.models.diffusion_constraint import (
+                DiffusionConstraint,
+            )
+
+            if self._tokenizer is None:
+                from vllm.tokenizers import cached_tokenizer_from_config
+
+                self._tokenizer = cached_tokenizer_from_config(self._model_config)
+            con = DiffusionConstraint.from_structured_outputs(
+                so, self._tokenizer, self.vocab_size
+            )
+            self._constraint_cache[key] = con
+            logger.info("Compiled diffusion canvas constraint for %s", key)
+        self._req_constraints[req_idx] = con
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -1288,18 +1325,24 @@ class DiffusionSampler:
             src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(logits.shape[0] - 1)
             logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(logits.dtype)
 
-        # Experimental opt-in: canvas-aware constrained decoding. Replace the
-        # per-position logits with constrained marginals so every denoising step
-        # is steered toward a DFA-accepted canvas. Enabled only when
-        # VLLM_DIFFUSION_CONSTRAINT points at a precompiled constraint file; the
-        # default path and the request-time structured-output guard are untouched.
-        if num_decode > 0:
-            constraint = self._get_diffusion_constraint(device)
-            if constraint is not None:
-                marg = constraint.constrained_log_marginals(
-                    logits.float().view(num_decode, CL, self.vocab_size)
-                )
-                logits = marg.view(num_decode * CL, self.vocab_size).to(logits.dtype)
+        # Canvas-aware constrained decoding: replace each request's per-position
+        # logits with constrained marginals so every denoising step is steered
+        # toward a DFA-accepted canvas. Applied per decode row from its
+        # per-request constraint (regex/choice structured outputs), falling back
+        # to a global constraint file (VLLM_DIFFUSION_CONSTRAINT) if set. When no
+        # request is constrained this is a no-op.
+        global_constraint = self._get_diffusion_constraint(device)
+        if num_decode > 0 and (self._req_constraints or global_constraint is not None):
+            lv = logits.float().view(num_decode, CL, self.vocab_size)
+            for k in range(num_decode):
+                con = self._req_constraints.get(int(decode_slots_np[k]))
+                if con is None:
+                    con = global_constraint
+                if con is not None:
+                    lv[k : k + 1] = con.to(device).constrained_log_marginals(
+                        lv[k : k + 1]
+                    )
+            logits = lv.view(num_decode * CL, self.vocab_size).to(logits.dtype)
 
         # Clear once: the tiled loop below only scatters its own decode slots,
         # so it must not re-clear earlier tiles' writes.
