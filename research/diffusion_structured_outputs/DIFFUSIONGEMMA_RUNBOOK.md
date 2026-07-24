@@ -116,10 +116,35 @@ NVFP4` and schema `{"active":boolean,"age":integer}` (33-state DFA, 179 edges):
 baseline output `''`; **constrained output `{"active":true,"age":6}`** — valid JSON,
 schema-conformant, from the real NVFP4 model.
 
-Notes: fp32 DP over `[num_decode, CL, V]` adds a transient (~1.5 GB at CL=256,
-batch 1) — lower `--gpu-memory-utilization` if tight. Per-request constraints (vs
-the engine-wide env flag) and the joint-sample hardening for a guaranteed-valid
-commit are the natural follow-ups; see `design.md`.
+Notes: fp32 DP over `[num_decode, CL, V]` adds a transient — computed over the
+~thousands of relevant token columns and scattered to full-V once
+(`constrained_log_marginals`), ~20 ms/call at CL=256.
+
+### Per-request via the normal API (regex / choice) — status
+
+Wired end to end (commits d100ce710 → 056be7154): the guard allows `regex`/`choice`
+for diffusion, `core.py` detaches `structured_output_request` so the AR grammar
+machinery is bypassed, `DiffusionSampler.add_request` compiles+caches a per-slot
+`DiffusionConstraint` from `sampling_params.structured_outputs`, and `__call__`
+applies it per decode row. The compiler and marginals are oracle-exact (unit
+tests). Usage:
+
+```python
+from vllm.sampling_params import StructuredOutputsParams as SO
+SamplingParams(temperature=1.0, structured_outputs=SO(regex=r"..."))   # or choice=[...]
+```
+
+**Known issue (open):** the *runtime* constraint compile — `get_vocab()` +
+`convert_tokens_to_string` over the 262k vocab through the **serving tokenizer
+wrapper on the worker** — stalls the engine, even though the same scan is ~0.3 s
+in a standalone process and the DFA build is ~0.2 s. So the per-request path is
+not yet usable end-to-end. The **precompiled-file path works** (3 s, valid JSON —
+see above), which proves the sampler/marginals mechanism; the fix is to compile
+the DFA **off the worker hot-path** — in the engine-core input thread with the
+fast tokenizer (as the AR `StructuredOutputManager` does), threading the compiled
+edge list to the worker via `NewRequestData`, or precompiling per distinct spec.
+Also open (design.md §5): feed the diffusion convergence/confidence check the
+constrained marginals so a peaked constraint doesn't slow commit.
 
 ---
 
