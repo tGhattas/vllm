@@ -16,6 +16,7 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from types import SimpleNamespace
 from typing import Any
@@ -1220,6 +1221,20 @@ class DiffusionSampler:
     # Main entry point
     # ------------------------------------------------------------------
 
+    def _get_diffusion_constraint(self, device):
+        """Lazily load the opt-in canvas constraint (VLLM_DIFFUSION_CONSTRAINT)."""
+        if not hasattr(self, "_diffusion_constraint"):
+            self._diffusion_constraint = None
+            path = os.environ.get("VLLM_DIFFUSION_CONSTRAINT")
+            if path:
+                from vllm.model_executor.models.diffusion_constraint import (
+                    DiffusionConstraint,
+                )
+
+                self._diffusion_constraint = DiffusionConstraint.from_file(path, device)
+                logger.info("Loaded diffusion canvas constraint from %s", path)
+        return self._diffusion_constraint
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -1272,6 +1287,19 @@ class DiffusionSampler:
             valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)  # [num_decode, CL]
             src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(logits.shape[0] - 1)
             logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(logits.dtype)
+
+        # Experimental opt-in: canvas-aware constrained decoding. Replace the
+        # per-position logits with constrained marginals so every denoising step
+        # is steered toward a DFA-accepted canvas. Enabled only when
+        # VLLM_DIFFUSION_CONSTRAINT points at a precompiled constraint file; the
+        # default path and the request-time structured-output guard are untouched.
+        if num_decode > 0:
+            constraint = self._get_diffusion_constraint(device)
+            if constraint is not None:
+                marg = constraint.constrained_log_marginals(
+                    logits.float().view(num_decode, CL, self.vocab_size)
+                )
+                logits = marg.view(num_decode * CL, self.vocab_size).to(logits.dtype)
 
         # Clear once: the tiled loop below only scatters its own decode slots,
         # so it must not re-clear earlier tiles' writes.
