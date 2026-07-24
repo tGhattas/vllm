@@ -47,7 +47,9 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     cls = dgmod.DiffusionGemmaForConditionalGeneration
-    captured: list[np.ndarray] = []
+    # Keep the widest [L, V] tensor seen (the full-canvas denoise step, not the
+    # short prompt prefill), and log every fired shape.
+    best: dict = {"arr": None, "where": None}
     shapes: list[tuple] = []
 
     # NOTE: vLLM V1 runs the model in a separate EngineCore subprocess, so a
@@ -56,17 +58,14 @@ def main() -> None:
     def _capture(x, where):
         import torch as _t
 
-        if (
-            not isinstance(x, _t.Tensor)
-            or x.ndim < 2
-            or len(captured) >= args.num_capture
-        ):
-            return
-        if x.shape[-1] < 1000:  # not a logits-over-vocab tensor
+        if not isinstance(x, _t.Tensor) or x.ndim < 2 or x.shape[-1] < 1000:
             return
         arr = x.detach().float().cpu().numpy()
-        captured.append(arr)
+        if arr.ndim == 3:  # [B, L, V] -> [L, V]
+            arr = arr[0]
         shapes.append((where, tuple(arr.shape)))
+        if best["arr"] is None or arr.shape[0] > best["arr"].shape[0]:
+            best["arr"], best["where"] = arr, where
 
     # Hook the model's compute_logits (per-position logits over the canvas).
     _orig_cl = cls.compute_logits
@@ -120,22 +119,22 @@ def main() -> None:
     out = llm.generate([args.prompt], sp)
     text = out[0].outputs[0].text if out and out[0].outputs else ""
 
-    if not captured:
+    if best["arr"] is None:
         raise SystemExit(
-            "No logits captured — the compute_logits hook never fired. Check the "
-            "class/method name (####) against this vLLM version, or hook the "
-            "DiffusionSampler instead."
+            "No logits captured — the hook never fired. Check the class/method "
+            "name (####) against this vLLM version, or run with "
+            "VLLM_ENABLE_V1_MULTIPROCESSING=0 so the model runs in-process."
         )
 
-    stacked = np.stack(captured, axis=0)  # [steps, L, V]  (#### confirm axes)
+    stacked = best["arr"][None]  # [1, L, V]
     np.save(args.out, stacked)
     meta = {
         "model": args.model,
         "prompt": args.prompt,
-        "captured_shapes": shapes,
-        "stacked_shape": list(stacked.shape),
+        "kept_from": best["where"],
+        "kept_shape": list(best["arr"].shape),
+        "all_captured_shapes": shapes,
         "generated_text": text,
-        "note": "axis order assumed [step, position, vocab]; verify in dg_constrain",
     }
     with open("dg_meta.json", "w") as f:
         json.dump(meta, f, indent=2)

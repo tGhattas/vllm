@@ -104,9 +104,11 @@ committed vLLM code; the `sampling_params.py:915` guard stays).
 
 Real run of `nvidia/diffusiongemma-26B-A4B-it-NVFP4` (public, `modelopt_fp4`,
 canvas_length 256, vocab 262144, 128 experts). The verified constrained sampler ran
-on **real captured logits** `[8, 262144]`: unconstrained argmax was
-`' Fits Fits Fits ...'`; the digits-only DFA gave `99999999` (greedy) /
-`99959999` (sample) — all digits, DFA-accepted. Non-obvious fixes learned:
+on **real captured logits**: unconstrained argmax was `' Fits Fits ...'`; the
+digits-only DFA gave `99999999`. On a real JSON schema
+(`{"active":boolean,"age":integer}`), charset-pruning cut the 262144 vocab to 4462
+relevant tokens (33-state DFA, 0.4 s) and greedy produced **valid JSON**
+`{"active":true,"age":1}` while the unconstrained argmax was newlines/`<eos>`. Non-obvious fixes learned:
 
 - **torch must match the precompiled `_C`'s CUDA.** `uv pip install -e .
   --torch-backend=auto` pulled torch **cu128**, but the precompiled vLLM `_C` needs
